@@ -1,0 +1,10 @@
+streamlit>=1.38,<2.0
+pandas>=2.0
+numpy>=1.24
+plotly>=5.20
+openpyxl>=3.1
+XlsxWriter>=3.2
+# Note: kaleido is intentionally NOT required. The Excel report's 6 charts
+# are built as native, interactive Excel chart objects (via XlsxWriter),
+# not rendered images -- so there's no headless-browser/Chrome dependency
+# for chart export at all.

@@ -1,0 +1,509 @@
+"""
+excel_export.py
+================
+Builds the downloadable DSM penalty report as a single, formula-driven Excel
+sheet that mirrors the plant's standard "Schedule vs Meter + Penalty"
+template:
+
+    Row 1        Title
+    Row 2        Note
+    Row 4        Column headers (Block, Time, AI Schedule (MW), Actual (MW),
+                 Deviation (MW), Deviation % (Capacity), Penalty (Rs),
+                 Scheduled at)
+    Rows 5..N    One row per matched block. Deviation, Deviation % and
+                 Penalty are LIVE EXCEL FORMULAS (not pre-computed numbers)
+                 that reference the DSM slab parameter table at the bottom
+                 of the sheet, so the workbook is fully auditable/editable
+                 in Excel.
+    (blank)
+    DAY SUMMARY section    -- accuracy & penalty roll-up, formula driven
+    (blank)
+    DSM SLAB PARAMETERS    -- installed capacity, block-energy factor and
+                               the slab table the Penalty formulas reference
+
+Every formula cell is written with XlsxWriter's write_formula(), which lets
+us store a CACHED VALUE alongside the formula string (the value already
+computed in Python by calculator.py). This means the numbers display
+correctly immediately -- in Excel/LibreOffice/Google Sheets, in a quick
+preview pane, or when read back with pandas -- without requiring the
+consuming application to run its own formula engine. Opening the file in a
+real spreadsheet app still shows (and recalculates) the live formula, so the
+report stays fully auditable.
+
+Conditional formatting highlights blocks with >0.5 MW deviation in red,
+<=0.5 MW in blue, and any block that actually incurred a penalty in red.
+"""
+
+from __future__ import annotations
+
+import io
+from typing import List
+
+import numpy as np
+import pandas as pd
+from xlsxwriter.utility import xl_rowcol_to_cell
+
+from config import PlantConfig
+
+# All 6 charts are built as NATIVE Excel chart objects (not images), so this
+# module has no dependency on kaleido / a headless browser at all -- charts
+# are just formulas + xlsxwriter chart definitions, which always work the
+# same way on every machine. Native charts are also fully interactive
+# (hover tooltips, zoom, edit) and stay live if the data changes.
+DARK_GREEN = "#1B4332"
+WHITE = "#FFFFFF"
+GRAY_TEXT = "#595959"
+RED = "#C00000"
+BLUE = "#1F4E9C"
+PINK_FILL = "#FCE4E4"
+BORDER_GRAY = "#BFBFBF"
+INPUT_BLUE = "#0000FF"
+
+HEADERS = [
+    "Block", "Time", "AI Schedule (MW)", "Actual (MW)", "Deviation (MW)",
+    "Deviation % (Capacity)", "Penalty (Rs)", "Scheduled at",
+]
+COL_WIDTHS = [8, 15, 17, 14, 15, 20, 13, 15]
+
+
+def _fmt_date(block_df: pd.DataFrame) -> str:
+    dates = sorted({d for d in block_df["Date"].dropna().unique()})
+    if not dates:
+        return "N/A"
+    if len(dates) == 1:
+        return str(dates[0])
+    return f"{dates[0]} to {dates[-1]}"
+
+
+def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig, figures: dict = None) -> bytes:
+    # `figures` is accepted for backward compatibility with older callers but
+    # is no longer used -- charts are built natively from worksheet formulas,
+    # not rendered from the Plotly figures / kaleido.
+    output = io.BytesIO()
+    wb = __import__("xlsxwriter").Workbook(output, {"in_memory": True})
+    ws = wb.add_worksheet("Schedule vs Meter + Penalty")
+    ws_graphs = wb.add_worksheet("Graphs")
+    SHEET = "Schedule vs Meter + Penalty"
+
+    n = len(block_df)
+    header_row_0 = 3          # 0-indexed row for the column header row (Excel row 4)
+    data_start_0 = 4          # 0-indexed first data row (Excel row 5)
+    data_end_0 = data_start_0 + n - 1
+
+    def xl_row(zero_based: int) -> int:
+        return zero_based + 1  # 1-indexed Excel row number for formula strings
+
+    # ------------------------------------------------------------- Formats
+    title_fmt = wb.add_format({"bold": True, "font_size": 12, "font_color": DARK_GREEN, "font_name": "Arial"})
+    note_fmt = wb.add_format({"italic": True, "font_size": 9, "font_color": GRAY_TEXT, "font_name": "Arial"})
+    header_fmt = wb.add_format({
+        "bold": True, "font_size": 10, "font_color": WHITE, "bg_color": DARK_GREEN,
+        "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1,
+        "border_color": BORDER_GRAY, "font_name": "Arial",
+    })
+    section_fmt = wb.add_format({"bold": True, "font_size": 12, "font_color": DARK_GREEN, "font_name": "Arial"})
+    label_fmt = wb.add_format({"font_size": 10, "font_name": "Arial"})
+    input_fmt = wb.add_format({"font_size": 10, "font_color": INPUT_BLUE, "font_name": "Arial"})
+    total_label_fmt = wb.add_format({"bold": True, "font_size": 10, "font_color": RED, "font_name": "Arial"})
+    total_value_fmt = wb.add_format({
+        "bold": True, "font_size": 10, "font_color": RED, "bg_color": PINK_FILL,
+        "num_format": "0.00", "font_name": "Arial",
+    })
+    cell_fmt = wb.add_format({"align": "center", "border": 1, "border_color": BORDER_GRAY})
+    mw_fmt = wb.add_format({"align": "center", "border": 1, "border_color": BORDER_GRAY, "num_format": "0.000"})
+    pct_fmt = wb.add_format({"align": "center", "border": 1, "border_color": BORDER_GRAY, "num_format": "+0.00;-0.00"})
+    pen_fmt = wb.add_format({"align": "center", "border": 1, "border_color": BORDER_GRAY, "num_format": "0.00"})
+    slab_edge_fmt = wb.add_format({"num_format": "0.000"})
+    red_font = wb.add_format({"font_color": RED})
+    blue_font = wb.add_format({"font_color": BLUE})
+
+    fmt_int = wb.add_format({"num_format": "0"})
+    fmt_3dp = wb.add_format({"num_format": "0.000"})
+    fmt_signed_3dp = wb.add_format({"num_format": "+0.000;-0.000"})
+    fmt_2dp = wb.add_format({"num_format": "0.00"})
+
+    # ---------------------------------------------------------------- Title
+    report_date = _fmt_date(block_df)
+    ws.merge_range(0, 0, 0, len(HEADERS) - 1,
+                    f"{plant.name} — AI Schedule vs Actual with DSM Penalty — {report_date}", title_fmt)
+    ws.merge_range(1, 0, 1, len(HEADERS) - 1,
+                    "Auto-generated by the AI Schedule Evaluation Dashboard. "
+                    "Penalty is graded against actual meter data using piecewise DSM slab logic.", note_fmt)
+
+    # -------------------------------------------------------------- Header
+    ws.set_row(header_row_0, 26.4)
+    for i, h in enumerate(HEADERS):
+        ws.write(header_row_0, i, h, header_fmt)
+
+    # ----------------------------------------------------------- Data rows
+    has_generated_at = "Generated_At" in block_df.columns
+    for offset, (_, row) in enumerate(block_df.iterrows()):
+        r0 = data_start_0 + offset
+        r = xl_row(r0)
+        ws.write_number(r0, 0, int(row["Block"]), cell_fmt)
+        ws.write_string(r0, 1, str(row["Time_Label"]), cell_fmt)
+        ws.write_number(r0, 2, float(row["Scheduled_MW"]), mw_fmt)
+        ws.write_number(r0, 3, float(row["Actual_MW"]), mw_fmt)
+        ws.write_formula(r0, 4, f"=D{r}-C{r}", mw_fmt, float(row["Deviation_MW"]))
+        # F (Deviation %) and G (Penalty) filled after the slab table is laid
+        # out below, since their formulas reference those cells.
+        if has_generated_at:
+            val = row.get("Generated_At")
+            if pd.notna(val) and str(val).strip().lower() != "nan":
+                ws.write_string(r0, 7, str(val), cell_fmt)
+            else:
+                ws.write_blank(r0, 7, None, cell_fmt)
+        else:
+            ws.write_blank(r0, 7, None, cell_fmt)
+
+    # --------------------------------------------------------- Day summary
+    blank1_0 = data_end_0 + 1
+    summary_header_0 = blank1_0 + 1
+    ws.write(summary_header_0, 0, "DAY SUMMARY — ACCURACY AND DSM PENALTY", section_fmt)
+
+    dev = block_df["Deviation_MW"].to_numpy() if n else np.array([])
+    pen = block_df["Total_Block_Penalty"].to_numpy() if n else np.array([])
+    cap = plant.installed_capacity_mw
+    s, e = xl_row(data_start_0), xl_row(data_end_0)
+
+    summary_defs = [
+        ("Blocks with a real meter reading", f"=COUNT(D{s}:D{e})", fmt_int, float(n)),
+        ("Total scheduled (MW, scored blocks)", f'=SUMIF(D{s}:D{e},"<>",C{s}:C{e})', fmt_3dp,
+         float(block_df["Scheduled_MW"].sum()) if n else 0.0),
+        ("Total actual (MW)", f"=SUM(D{s}:D{e})", fmt_3dp, float(block_df["Actual_MW"].sum()) if n else 0.0),
+        ("Total deviation — actual minus scheduled (MW)", f"=SUM(E{s}:E{e})", fmt_signed_3dp,
+         float(dev.sum()) if n else 0.0),
+        ("Mean absolute deviation (MW)", f"=SUMPRODUCT(ABS(E{s}:E{e}))/COUNT(E{s}:E{e})", fmt_3dp,
+         float(np.abs(dev).mean()) if n else 0.0),
+        ("Max absolute deviation (MW)", f"=MAX(MAX(E{s}:E{e}),-MIN(E{s}:E{e}))", fmt_3dp,
+         float(np.abs(dev).max()) if n else 0.0),
+        ("Blocks over 0.5 MW deviation (RED)", f'=SUMPRODUCT((ABS(E{s}:E{e})>0.5)*(D{s}:D{e}<>""))', fmt_int,
+         float((np.abs(dev) > 0.5).sum()) if n else 0.0),
+        ("Blocks within 0.5 MW deviation (BLUE)", f'=SUMPRODUCT((ABS(E{s}:E{e})<=0.5)*(D{s}:D{e}<>""))', fmt_int,
+         float((np.abs(dev) <= 0.5).sum()) if n else 0.0),
+        ("Mean absolute deviation (% of capacity)", None, fmt_2dp,
+         float(np.abs(dev).mean() / cap * 100) if n else 0.0),  # formula added after cap_row known
+        ("Blocks that incurred a penalty", f'=COUNTIF(G{s}:G{e},">0")', fmt_int,
+         float((pen > 0).sum()) if n else 0.0),
+        ("Worst single-block penalty (Rs)", f"=MAX(G{s}:G{e})", fmt_2dp, float(pen.max()) if n else 0.0),
+        ("TOTAL DSM PENALTY FOR THE DAY (Rs)", f"=SUM(G{s}:G{e})", fmt_2dp, float(pen.sum()) if n else 0.0),
+    ]
+    summary_rows_0 = {}
+    for i, (label, formula, numfmt, cached) in enumerate(summary_defs):
+        r0 = summary_header_0 + 1 + i
+        ws.write(r0, 0, label, label_fmt)
+        summary_rows_0[label] = r0
+        if formula is not None:
+            ws.write_formula(r0, 2, formula, numfmt, cached)
+        # else: filled in later once the capacity cell row is known
+
+    total_row_0 = summary_rows_0["TOTAL DSM PENALTY FOR THE DAY (Rs)"]
+    ws.write(total_row_0, 0, "TOTAL DSM PENALTY FOR THE DAY (Rs)", total_label_fmt)
+    ws.write_formula(total_row_0, 2, f"=SUM(G{s}:G{e})", total_value_fmt, float(pen.sum()) if n else 0.0)
+
+    # ------------------------------------------------------ Slab parameters
+    blank2_0 = total_row_0 + 1
+    slab_section_0 = blank2_0 + 1
+    ws.write(slab_section_0, 0, "DSM SLAB PARAMETERS (the Penalty column references these cells)", section_fmt)
+
+    cap_row_0 = slab_section_0 + 1
+    ws.write(cap_row_0, 0, "Installed capacity (MW)", label_fmt)
+    ws.write_number(cap_row_0, 2, plant.installed_capacity_mw, input_fmt)
+    cap_row = xl_row(cap_row_0)
+
+    energy_factor_row_0 = cap_row_0 + 1
+    ws.write(energy_factor_row_0, 0, f"Block energy factor ({plant.block_hours:g} h x 1000 kW/MW)", label_fmt)
+    ws.write_number(energy_factor_row_0, 2, plant.block_hours * 1000, input_fmt)
+    energy_factor_row = xl_row(energy_factor_row_0)
+
+    slab_table_header_0 = energy_factor_row_0 + 2
+    for i, h in enumerate(["Slab", "From %", "To %", "Rate (Rs/kWh)", "Upper edge (MW)"]):
+        ws.write(slab_table_header_0, i, h, header_fmt)
+
+    slab_rows: List[int] = []
+    for i, slab in enumerate(plant.dsm_slabs):
+        r0 = slab_table_header_0 + 1 + i
+        r = xl_row(r0)
+        slab_rows.append(r)
+        ws.write(r0, 0, f"Slab {i + 1}", label_fmt)
+        ws.write_number(r0, 1, slab.lower)
+        if slab.upper is not None:
+            ws.write_number(r0, 2, slab.upper)
+        else:
+            ws.write_string(r0, 2, "above")
+        ws.write_number(r0, 3, slab.rate, input_fmt)
+        if slab.upper is not None:
+            edge_value = plant.installed_capacity_mw * slab.upper / 100.0
+            ws.write_formula(r0, 4, f"=$C${cap_row}*{slab.upper}/100", slab_edge_fmt, edge_value)
+
+    # ---------------------------------------------- Now fill in the formulas
+    # that depend on cap_row / energy_factor_row / slab_rows
+    for offset in range(n):
+        r0 = data_start_0 + offset
+        r = xl_row(r0)
+        dev_pct_val = float(block_df.iloc[offset]["Deviation_%"])
+        ws.write_formula(r0, 5, f"=E{r}/$C${cap_row}*100", pct_fmt, dev_pct_val)
+
+        terms = []
+        prev_bound = "0"
+        for slab, srow in zip(plant.dsm_slabs, slab_rows):
+            rate_ref = f"$D${srow}"
+            if slab.upper is not None:
+                bound_ref = f"$E${srow}"
+                terms.append(f"MAX(0,MIN(ABS(E{r}),{bound_ref})-{prev_bound})*{rate_ref}")
+                prev_bound = bound_ref
+            else:
+                terms.append(f"MAX(0,ABS(E{r})-{prev_bound})*{rate_ref}")
+        formula = f"=$C${energy_factor_row}*(" + "+".join(terms) + ")"
+        penalty_val = float(block_df.iloc[offset]["Total_Block_Penalty"])
+        ws.write_formula(r0, 6, formula, pen_fmt, penalty_val)
+
+    mad_pct_row_0 = summary_rows_0["Mean absolute deviation (% of capacity)"]
+    mad_pct_cached = float(np.abs(dev).mean() / cap * 100) if n else 0.0
+    ws.write_formula(
+        mad_pct_row_0, 2,
+        f"=SUMPRODUCT(ABS(E{s}:E{e}))/COUNT(E{s}:E{e})/$C${cap_row}*100",
+        fmt_2dp, mad_pct_cached,
+    )
+
+    # --------------------------------------------------------- Conditional
+    if n:
+        ws.conditional_format(s - 1, 4, e - 1, 5, {
+            "type": "formula",
+            "criteria": f"AND(ISNUMBER($E{s}),ABS($E{s})>0.5)",
+            "format": red_font,
+        })
+        ws.conditional_format(s - 1, 4, e - 1, 5, {
+            "type": "formula",
+            "criteria": f"AND(ISNUMBER($E{s}),ABS($E{s})<=0.5)",
+            "format": blue_font,
+        })
+        ws.conditional_format(s - 1, 6, e - 1, 6, {
+            "type": "formula",
+            "criteria": f"AND(ISNUMBER($G{s}),$G{s}>0)",
+            "format": red_font,
+        })
+
+    # -------------------------------------------------------------- Layout
+    ws.freeze_panes(data_start_0, 0)
+    for i, width in enumerate(COL_WIDTHS):
+        ws.set_column(i, i, width)
+
+    # ------------------------------------------------ Charts (native, on both sheets)
+    if n:
+        dev_values = block_df["Deviation_MW"].to_numpy()
+        pen_values = block_df["Total_Block_Penalty"].to_numpy()
+        dev_pct_values = block_df["Deviation_%"].to_numpy()
+        helper = _write_chart_helper_data(ws_graphs, SHEET, data_start_0, data_end_0, s, e,
+                                           dev_values, pen_values, dev_pct_values)
+        ws_graphs.merge_range(0, 0, 0, 7, f"{plant.name} — DSM Evaluation Charts", title_fmt)
+        _add_all_charts(wb, ws, SHEET, report_date, data_start_0, data_end_0, helper, dev_values,
+                         anchor_col_left=9, anchor_col_right=23, row_step=18, size=(430, 260))
+        _add_all_charts(wb, ws_graphs, SHEET, report_date, data_start_0, data_end_0, helper, dev_values,
+                         anchor_col_left=0, anchor_col_right=11, row_step=22, size=(560, 340),
+                         start_row=2)
+
+    wb.close()
+    return output.getvalue()
+
+
+# Friendly titles for every native chart, in the same order as the
+# dashboard's "Charts" tab, so the main sheet and the Graphs sheet always
+# show the same set in the same order as the live dashboard.
+CHART_TITLES = {
+    "actual_vs_predicted": "Actual vs Predicted Generation",
+    "deviation_bar": "Deviation (MW) by Block",
+    "penalty_bar": "DSM Penalty (Rs) by Block",
+    "cumulative_penalty": "Cumulative DSM Penalty Through the Day",
+    "over_under_pie": "Over vs Under Generation Blocks",
+    "deviation_histogram": "Distribution of Deviation %",
+}
+
+# Helper-data layout on the "Graphs" sheet -- far-right hidden columns that
+# feed the charts native Excel can't drive straight from the main sheet's own
+# columns (a running cumulative total, category counts, histogram bins).
+_H_CUM = 28          # AC: cumulative penalty, one row per data row (aligned with main sheet rows)
+_H_PIE_LABEL = 30    # AE: 3 rows -- Over / Under / No Deviation
+_H_PIE_COUNT = 31    # AF
+_H_BIN_EDGE = 33     # AH: 11 histogram bin edges
+_H_BIN_LABEL = 34    # AI: 10 histogram bin labels
+_H_BIN_COUNT = 35    # AJ: 10 histogram bin counts
+
+
+def _write_chart_helper_data(ws_graphs, main_sheet: str, data_start_0: int, data_end_0: int, s: int, e: int,
+                              dev_values, pen_values, dev_pct_values) -> dict:
+    """Write hidden formula-driven helper data on the Graphs sheet that the
+    native charts reference for series the main sheet's own columns can't
+    drive directly: a running cumulative-penalty total, over/under/no-
+    deviation counts, and Deviation % histogram bins.
+
+    Every cell is written with a CACHED VALUE (computed in Python from the
+    same numbers already in block_df) alongside its live formula -- exactly
+    like the main sheet's formula cells -- so the charts that reference these
+    cells show correct data immediately in every viewer (LibreOffice, a
+    quick-preview pane, pandas) without requiring a formula recalculation
+    pass first. Opening the file in a real spreadsheet still shows (and can
+    recalculate) the live formula.
+    """
+    dev_range = f"'{main_sheet}'!$E${s}:$E${e}"
+    dev_pct_range = f"'{main_sheet}'!$F${s}:$F${e}"
+
+    # Running cumulative penalty, one formula per data row, aligned to the
+    # SAME row numbers as the main sheet so the main sheet's own Time_Label
+    # column (B) can be reused as the category axis.
+    cum = np.cumsum(pen_values) if len(pen_values) else np.array([])
+    for offset in range(data_end_0 - data_start_0 + 1):
+        r0 = data_start_0 + offset
+        r = r0 + 1
+        ws_graphs.write_formula(r0, _H_CUM, f"=SUM('{main_sheet}'!$G${s}:$G${r})", None, float(cum[offset]))
+
+    # Over / Under / No Deviation counts, for the pie chart.
+    pie_defs = [
+        ("Over Generation", ">0", int((dev_values > 0).sum())),
+        ("Under Generation", "<0", int((dev_values < 0).sum())),
+        ("No Deviation", "=0", int((dev_values == 0).sum())),
+    ]
+    for i, (label, criteria, count) in enumerate(pie_defs):
+        ws_graphs.write(i, _H_PIE_LABEL, label)
+        ws_graphs.write_formula(i, _H_PIE_COUNT, f'=COUNTIF({dev_range},"{criteria}")', None, count)
+
+    # 10 equal-width Deviation % histogram bins, spanning the data's own
+    # min/max, for the histogram chart.
+    n_bins = 10
+    if len(dev_pct_values):
+        lo_val, hi_val = float(np.min(dev_pct_values)), float(np.max(dev_pct_values))
+    else:
+        lo_val, hi_val = 0.0, 0.0
+    edges = [lo_val + i * (hi_val - lo_val) / n_bins for i in range(n_bins + 1)]
+    for i, edge_val in enumerate(edges):
+        ws_graphs.write_formula(
+            i, _H_BIN_EDGE,
+            f"=MIN({dev_pct_range})+({i})*(MAX({dev_pct_range})-MIN({dev_pct_range}))/{n_bins}",
+            None, edge_val,
+        )
+    for i in range(n_bins):
+        lo_cell = xl_rowcol_to_cell(i, _H_BIN_EDGE)
+        hi_cell = xl_rowcol_to_cell(i + 1, _H_BIN_EDGE)
+        upper_op = "<=" if i == n_bins - 1 else "<"
+        lo_edge, hi_edge = edges[i], edges[i + 1]
+        if i == n_bins - 1:
+            bin_count = int(((dev_pct_values >= lo_edge) & (dev_pct_values <= hi_edge)).sum()) if len(dev_pct_values) else 0
+        else:
+            bin_count = int(((dev_pct_values >= lo_edge) & (dev_pct_values < hi_edge)).sum()) if len(dev_pct_values) else 0
+        bin_label = f"{lo_edge:.1f} to {hi_edge:.1f}%"
+        ws_graphs.write_formula(i, _H_BIN_LABEL, f'=TEXT({lo_cell},"0.0")&" to "&TEXT({hi_cell},"0.0")&"%"',
+                                 None, bin_label)
+        ws_graphs.write_formula(
+            i, _H_BIN_COUNT,
+            f'=COUNTIFS({dev_pct_range},">="&{lo_cell},{dev_pct_range},"{upper_op}"&{hi_cell})',
+            None, bin_count,
+        )
+
+    ws_graphs.set_column(_H_CUM, _H_BIN_COUNT, None, None, {"hidden": True})
+
+    GRAPHS = "Graphs"
+    return {
+        "cum_values": [GRAPHS, data_start_0, _H_CUM, data_end_0, _H_CUM],
+        "pie_categories": [GRAPHS, 0, _H_PIE_LABEL, 2, _H_PIE_LABEL],
+        "pie_values": [GRAPHS, 0, _H_PIE_COUNT, 2, _H_PIE_COUNT],
+        "hist_categories": [GRAPHS, 0, _H_BIN_LABEL, n_bins - 1, _H_BIN_LABEL],
+        "hist_values": [GRAPHS, 0, _H_BIN_COUNT, n_bins - 1, _H_BIN_COUNT],
+    }
+
+
+def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, data_end_0: int,
+                     helper: dict, dev_values, anchor_col_left: int, anchor_col_right: int, row_step: int,
+                     size: tuple, start_row: int = 2):
+    """Build all 6 native, interactive Excel chart objects and place them on
+    `ws` in a two-column grid (left: Actual vs Predicted, Penalty, Over/Under
+    pie; right: Deviation, Cumulative penalty, Histogram) -- mirroring the
+    dashboard's own Charts tab layout. Every chart is a live Excel chart
+    object (hover tooltips, zoom, editable) built from cell references, so
+    no image rendering / kaleido is involved at all."""
+    cat_range = [sheet, data_start_0, 1, data_end_0, 1]  # column B (Time block)
+    width, height = size
+
+    def _placed(chart, col, row):
+        chart.set_size({"width": width, "height": height})
+        ws.insert_chart(row, col, chart)
+
+    # 1) Actual vs Predicted -- line chart
+    c1 = wb.add_chart({"type": "line"})
+    c1.add_series({
+        "name": [sheet, 3, 2], "categories": cat_range,
+        "values": [sheet, data_start_0, 2, data_end_0, 2],
+        "line": {"color": "#15803D", "width": 2},
+    })
+    c1.add_series({
+        "name": [sheet, 3, 3], "categories": cat_range,
+        "values": [sheet, data_start_0, 3, data_end_0, 3],
+        "line": {"color": "#F59E0B", "width": 2},
+    })
+    c1.set_title({"name": f"Actual vs Predicted Generation - {report_date}"})
+    c1.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
+    c1.set_y_axis({"name": "MW"})
+    c1.set_legend({"position": "bottom"})
+
+    # 2) Deviation (MW) by Block -- column chart, red/green per point
+    c2 = wb.add_chart({"type": "column"})
+    points = [{"fill": {"color": "#16A34A" if v >= 0 else "#DC2626"}} for v in dev_values] or None
+    c2.add_series({
+        "name": CHART_TITLES["deviation_bar"], "categories": cat_range,
+        "values": [sheet, data_start_0, 4, data_end_0, 4],
+        "points": points,
+    })
+    c2.set_title({"name": f"Deviation (MW) by Block - {report_date}"})
+    c2.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
+    c2.set_y_axis({"name": "Deviation MW"})
+    c2.set_legend({"none": True})
+
+    # 3) DSM Penalty (Rs) by Block -- column chart
+    c3 = wb.add_chart({"type": "column"})
+    c3.add_series({
+        "name": CHART_TITLES["penalty_bar"], "categories": cat_range,
+        "values": [sheet, data_start_0, 6, data_end_0, 6],
+        "fill": {"color": "#7C3AED"},
+    })
+    c3.set_title({"name": f"DSM Penalty (Rs) by Block - {report_date}"})
+    c3.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
+    c3.set_y_axis({"name": "Penalty (Rs)"})
+    c3.set_legend({"none": True})
+
+    # 4) Cumulative DSM Penalty -- area chart
+    c4 = wb.add_chart({"type": "area"})
+    c4.add_series({
+        "name": CHART_TITLES["cumulative_penalty"], "categories": cat_range,
+        "values": helper["cum_values"],
+        "fill": {"color": "#0F766E", "transparency": 30},
+        "line": {"color": "#0F766E", "width": 2},
+    })
+    c4.set_title({"name": f"Cumulative DSM Penalty Through the Day - {report_date}"})
+    c4.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
+    c4.set_y_axis({"name": "Cumulative Penalty (Rs)"})
+    c4.set_legend({"none": True})
+
+    # 5) Over vs Under Generation -- pie chart
+    c5 = wb.add_chart({"type": "pie"})
+    c5.add_series({
+        "categories": helper["pie_categories"], "values": helper["pie_values"],
+        "points": [{"fill": {"color": "#16A34A"}}, {"fill": {"color": "#DC2626"}}, {"fill": {"color": "#64748B"}}],
+        "data_labels": {"percentage": True, "category": True},
+    })
+    c5.set_title({"name": "Over vs Under Generation Blocks"})
+
+    # 6) Distribution of Deviation % -- histogram-style column chart
+    c6 = wb.add_chart({"type": "column"})
+    c6.add_series({
+        "name": CHART_TITLES["deviation_histogram"], "categories": helper["hist_categories"],
+        "values": helper["hist_values"], "fill": {"color": "#15803D"}, "gap": 0,
+    })
+    c6.set_title({"name": "Distribution of Deviation %"})
+    c6.set_x_axis({"name": "Deviation % of capacity", "num_font": {"size": 7}})
+    c6.set_y_axis({"name": "Number of blocks"})
+    c6.set_legend({"none": True})
+
+    left = [c1, c3, c5]
+    right = [c2, c4, c6]
+    for col, charts in ((anchor_col_left, left), (anchor_col_right, right)):
+        for i, chart in enumerate(charts):
+            _placed(chart, col, start_row + i * row_step)
