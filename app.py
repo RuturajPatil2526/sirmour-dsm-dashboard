@@ -20,8 +20,11 @@ import pandas as pd
 import streamlit as st
 
 from config import PLANT_CONFIGS, DEFAULT_PLANT, PlantConfig
-from utils import parse_energy_file, merge_datasets, FileValidationError
-from calculator import evaluate_schedule, build_summary, day_summary_metrics
+from utils import (
+    parse_energy_file, merge_datasets, FileValidationError,
+    parse_enercast_file, merge_enercast,
+)
+from calculator import evaluate_schedule, build_summary, day_summary_metrics, evaluate_enercast, enercast_summary
 from graphs import all_figures
 from excel_export import build_excel_report
 
@@ -176,6 +179,13 @@ with st.sidebar:
         "Meter Data File (Actual Generation)", type=["csv", "xlsx", "xls"],
         help="Must contain Date/Time and Actual MW (or kW) for each block.",
     )
+    enercast_file = st.file_uploader(
+        "Enercast File (optional — for comparison)", type=["csv", "xlsx", "xls"],
+        help="A third-party forecast (e.g. Enercast) shown alongside our own AI "
+             "Schedule purely for comparison. Our own forecast is always graded "
+             "against actual meter data only — Enercast never affects it. "
+             "Matched to the report by Block number.",
+    )
 
     with st.expander("Advanced: timestamp alignment"):
         st.caption(
@@ -187,6 +197,8 @@ with st.sidebar:
                                   index=0, horizontal=True, key="sched_ts_mode")
         meter_ts_mode = st.radio("Meter Data file timestamp marks:", ["start", "end"],
                                   index=0, horizontal=True, key="meter_ts_mode")
+        enercast_ts_mode = st.radio("Enercast file timestamp marks:", ["start", "end"],
+                                     index=0, horizontal=True, key="enercast_ts_mode")
 
     process_clicked = st.button("🚀 Process & Evaluate", type="primary", use_container_width=True,
                                  disabled=not (schedule_file and meter_file))
@@ -247,6 +259,21 @@ if process_clicked or "result_df" in st.session_state:
                     tuple((s.lower, s.upper, s.rate) for s in plant.dsm_slabs),
                 )
                 result_df = evaluate_schedule(merged, plant)
+
+                # Enercast is entirely optional and comparison-only -- it
+                # never touches result_df's own Scheduled_MW/Deviation/
+                # Penalty columns above, which are already final at this
+                # point (graded only against actual meter data).
+                if enercast_file is not None:
+                    enercast_file.seek(0)
+                    enercast_res = parse_enercast_file(
+                        enercast_file, block_minutes=plant.block_minutes,
+                        timestamp_marks=st.session_state.enercast_ts_mode,
+                    )
+                    result_df, enercast_warnings = merge_enercast(result_df, enercast_res)
+                    result_df = evaluate_enercast(result_df, plant)
+                    warnings = warnings + enercast_warnings
+
                 summary = build_summary(result_df, plant)
 
             # Build the Excel report ONLY here, once per "Process & Evaluate"
@@ -368,6 +395,11 @@ with tab_charts:
     if filtered.empty:
         st.warning("No blocks match the current filters.")
     else:
+        if "Enercast_MW" in filtered.columns:
+            st.caption(
+                "🔵 Enercast is plotted alongside for comparison on every chart below — "
+                "our own forecast is still graded against actual meter data only, never against Enercast."
+            )
         figs = all_figures(filtered)
         c1, c2 = st.columns(2)
         with c1:
@@ -438,10 +470,14 @@ with tab_table:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with tab_report:
+    has_enercast = "Enercast_MW" in result_df.columns
     st.caption(
         "This mirrors the exact layout of the downloadable Excel report "
         "(\"Schedule vs Meter + Penalty\") — the full day's data, not affected "
         "by the filters above."
+        + (" Enercast is shown alongside for comparison only — our forecast is "
+           "graded against actual meter data, never against Enercast."
+           if has_enercast else "")
     )
 
     report_cols = ["Block", "Time_Label", "Scheduled_MW", "Actual_MW",
@@ -456,6 +492,20 @@ with tab_report:
     else:
         report_df["Scheduled at"] = ""
 
+    fmt_dict = {
+        "AI Schedule (MW)": "{:.3f}", "Actual (MW)": "{:.3f}", "Deviation (MW)": "{:+.3f}",
+        "Deviation % (Capacity)": "{:+.2f}", "Penalty (Rs)": "{:.2f}",
+    }
+    if has_enercast:
+        report_df["Enercast (MW)"] = result_df["Enercast_MW"]
+        report_df["Enercast Deviation (MW)"] = result_df["Enercast_Deviation_MW"]
+        report_df["Enercast Deviation % (Capacity)"] = result_df["Enercast_Deviation_%"]
+        report_df["Enercast Penalty (Rs)"] = result_df["Enercast_Penalty"]
+        fmt_dict.update({
+            "Enercast (MW)": "{:.3f}", "Enercast Deviation (MW)": "{:+.3f}",
+            "Enercast Deviation % (Capacity)": "{:+.2f}", "Enercast Penalty (Rs)": "{:.2f}",
+        })
+
     def _report_style(row):
         styles = [""] * len(row)
         dev = row["Deviation (MW)"]
@@ -468,12 +518,25 @@ with tab_report:
             styles[idx] = "color:#C00000; font-weight:700;"
         return styles
 
-    styled_report = report_df.style.apply(_report_style, axis=1).format({
-        "AI Schedule (MW)": "{:.3f}", "Actual (MW)": "{:.3f}", "Deviation (MW)": "{:+.3f}",
-        "Deviation % (Capacity)": "{:+.2f}", "Penalty (Rs)": "{:.2f}",
-    })
-    st.caption("🔴 Deviation > 0.5 MW or a block with a penalty   🔵 Deviation ≤ 0.5 MW")
+    styled_report = report_df.style.apply(_report_style, axis=1).format(fmt_dict, na_rep="—")
+    st.caption("🔴 Deviation > 0.5 MW or a block with a penalty   🔵 Deviation ≤ 0.5 MW"
+               + ("   ⚪ — = no Enercast data for that block" if has_enercast else ""))
     st.dataframe(styled_report, use_container_width=True, hide_index=True, height=420)
+
+    if has_enercast:
+        e_summary = enercast_summary(result_df)
+        if e_summary:
+            st.markdown(
+                '<div class="section-header" style="font-size:1.05rem;">⚖️ Us vs Enercast (comparison only)</div>',
+                unsafe_allow_html=True,
+            )
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            ec1.metric("Blocks compared", e_summary["Blocks compared"])
+            ec2.metric("Our Penalty (same blocks)", f"₹{e_summary['Our Total Penalty (Rs, same blocks)']:.2f}")
+            ec3.metric("Enercast Penalty", f"₹{e_summary['Enercast Total Penalty (Rs)']:.2f}")
+            ec4.metric("Our Mean Abs Deviation", f"{e_summary['Our Mean Abs Deviation (MW)']:.3f} MW",
+                       delta=f"{e_summary['Our Mean Abs Deviation (MW)'] - e_summary['Enercast Mean Abs Deviation (MW)']:+.3f} MW vs Enercast",
+                       delta_color="inverse")
 
     st.markdown('<div class="section-header" style="font-size:1.05rem;">📑 Day Summary — Accuracy and DSM Penalty</div>',
                 unsafe_allow_html=True)

@@ -342,3 +342,44 @@ def merge_datasets(
         cols.append("Generated_At")
     merged = merged[cols]
     return merged, warnings
+
+
+# ---------------------------------------------------------------------------
+# Optional third file: Enercast (or any other third-party forecast), shown
+# alongside our own AI Schedule purely for comparison -- never used to grade
+# our own forecast, which is always graded against actual meter data only.
+# ---------------------------------------------------------------------------
+def parse_enercast_file(
+    uploaded_file, block_minutes: int = 15, timestamp_marks: str = "start"
+) -> ParseResult:
+    """Parse a third-party forecast file (e.g. Enercast's own predicted-MW
+    export). Reuses the same column auto-detection as the AI Schedule file
+    (role='schedule' picks up 'Scheduled MW' / 'Predicted (MW)' etc. aliases)
+    but is matched to the main dataset by BLOCK NUMBER ONLY -- these exports
+    commonly carry no reliable date column of their own (just a Time-of-day
+    column), so trusting their date would silently break the match.
+    """
+    result = parse_energy_file(uploaded_file, role="schedule",
+                                block_minutes=block_minutes, timestamp_marks=timestamp_marks)
+    df = result.df.rename(columns={"Scheduled_MW": "Enercast_MW"})
+    df = df[["Block", "Enercast_MW"]].drop_duplicates(subset=["Block"], keep="first")
+    result.df = df
+    return result
+
+
+def merge_enercast(block_df: pd.DataFrame, enercast_result: ParseResult) -> Tuple[pd.DataFrame, List[str]]:
+    """Left-merge the (already schedule+meter matched) block_df with the
+    optional Enercast data, matching on Block number only. Blocks the
+    Enercast file doesn't cover simply get a blank Enercast_MW -- this never
+    excludes a block from the main DSM calculation, since Enercast is
+    comparison-only."""
+    warnings = list(enercast_result.warnings)
+    merged = block_df.merge(enercast_result.df, on="Block", how="left")
+    covered = int(merged["Enercast_MW"].notna().sum())
+    missing = len(merged) - covered
+    if missing:
+        warnings.append(
+            f"Enercast: {missing} of {len(merged)} block(s) had no matching Enercast data "
+            f"(left blank in the 'Enercast (MW)' column)."
+        )
+    return merged, warnings

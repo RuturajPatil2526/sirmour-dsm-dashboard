@@ -27,7 +27,7 @@ tested and reused independently.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -111,6 +111,67 @@ def evaluate_schedule(merged_df: pd.DataFrame, plant: PlantConfig) -> pd.DataFra
         ordered_cols.append("Generated_At")
     df = df[ordered_cols]
     return df
+
+
+def evaluate_enercast(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
+    """Add Enercast comparison columns (Enercast_Deviation_MW,
+    Enercast_Deviation_%, Enercast_Penalty) using the SAME piecewise DSM
+    slab logic as evaluate_schedule(), but graded against Enercast_MW
+    instead of our own Scheduled_MW.
+
+    IMPORTANT: this is comparison-only. Our own forecast (Scheduled_MW) is
+    always graded against actual meter data alone -- Enercast never affects
+    Total_Block_Penalty or any other column evaluate_schedule() already
+    computed. Blocks with no Enercast data (Enercast_MW is NaN) simply get
+    NaN in every Enercast_* column here, and are excluded from any Enercast
+    summary totals.
+
+    A no-op (returns df unchanged) if the "Enercast_MW" column isn't present
+    -- callers only invoke this when an Enercast file was actually uploaded.
+    """
+    if "Enercast_MW" not in df.columns:
+        return df
+
+    df = df.copy()
+    capacity = plant.installed_capacity_mw
+    block_hours = plant.block_hours
+    slabs = plant.dsm_slabs
+
+    has_enercast = df["Enercast_MW"].notna()
+    dev_mw = (df["Actual_MW"] - df["Enercast_MW"]).where(has_enercast)
+    dev_pct = (dev_mw / capacity * 100.0)
+    block_energy = (dev_mw * block_hours * 1000.0)
+
+    penalties = np.full(len(df), np.nan)
+    for idx in df.index[has_enercast]:
+        abs_pct = abs(dev_pct.loc[idx])
+        energy_abs = abs(block_energy.loc[idx])
+        _, _, tot = compute_block_penalty(abs_pct, energy_abs, slabs)
+        penalties[df.index.get_loc(idx)] = tot
+
+    df["Enercast_Deviation_MW"] = dev_mw
+    df["Enercast_Deviation_%"] = dev_pct
+    df["Enercast_Penalty"] = penalties
+    return df
+
+
+def enercast_summary(df: pd.DataFrame) -> Optional[dict]:
+    """Head-to-head roll-up (blocks both forecasts covered) -- our own
+    Total_Block_Penalty vs Enercast_Penalty, and mean absolute deviation for
+    each. Returns None if no Enercast data is present."""
+    if "Enercast_MW" not in df.columns:
+        return None
+    covered = df[df["Enercast_MW"].notna()]
+    n = len(covered)
+    if n == 0:
+        return None
+    return {
+        "Blocks compared": n,
+        "Our Total Penalty (Rs, same blocks)": float(covered["Total_Block_Penalty"].sum()),
+        "Enercast Total Penalty (Rs)": float(covered["Enercast_Penalty"].sum()),
+        "Our Mean Abs Deviation (MW)": float(covered["Deviation_MW"].abs().mean()),
+        "Enercast Mean Abs Deviation (MW)": float(covered["Enercast_Deviation_MW"].abs().mean()),
+    }
 
 
 def build_summary(df: pd.DataFrame, plant: PlantConfig) -> dict:
