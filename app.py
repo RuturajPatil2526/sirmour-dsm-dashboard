@@ -341,6 +341,33 @@ r3[2].metric(
 r3[3].metric("Max Penalty Amount", f"₹{mpb['Penalty']:.2f}")
 
 # ---------------------------------------------------------------------------
+# Enercast comparison KPIs (only when an Enercast file was uploaded) --
+# shown right here at the top, alongside our own AI Schedule summary above,
+# so the two are visible side by side without digging into the Report tab.
+# Comparison-only: never affects the Total DSM Penalty / metrics above.
+# ---------------------------------------------------------------------------
+if "Enercast_MW" in result_df.columns:
+    e_summary_top = enercast_summary(result_df)
+    if e_summary_top:
+        st.markdown(
+            '<div class="section-header" style="font-size:1.05rem;">⚖️ Us vs Enercast (comparison only)</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "🔵 Enercast is a third-party forecast shown only for comparison — "
+            "our own Total DSM Penalty above is graded against actual meter data alone, never against Enercast."
+        )
+        re1, re2, re3, re4 = st.columns(4)
+        re1.metric("Blocks Compared", e_summary_top["Blocks compared"])
+        re2.metric("Our Penalty (same blocks)", f"₹{e_summary_top['Our Total Penalty (Rs, same blocks)']:.2f}")
+        re3.metric("Enercast Penalty", f"₹{e_summary_top['Enercast Total Penalty (Rs)']:.2f}")
+        re4.metric(
+            "Our Mean Abs Deviation", f"{e_summary_top['Our Mean Abs Deviation (MW)']:.3f} MW",
+            delta=f"{e_summary_top['Our Mean Abs Deviation (MW)'] - e_summary_top['Enercast Mean Abs Deviation (MW)']:+.3f} MW vs Enercast",
+            delta_color="inverse",
+        )
+
+# ---------------------------------------------------------------------------
 # Filters
 # ---------------------------------------------------------------------------
 st.markdown('<div class="section-header">🔍 Filters</div>', unsafe_allow_html=True)
