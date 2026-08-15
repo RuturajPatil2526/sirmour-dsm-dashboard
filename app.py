@@ -240,7 +240,9 @@ def _run_pipeline(sched_bytes, sched_name, meter_bytes, meter_name,
                                    block_minutes=block_minutes, timestamp_marks=sched_ts_mode)
     meter_res = parse_energy_file(meter_file_, role="meter",
                                    block_minutes=block_minutes, timestamp_marks=meter_ts_mode)
-    merged, warnings = merge_datasets(sched_res, meter_res)
+    blocks_per_day = int(24 * 60 / block_minutes)
+    merged, warnings = merge_datasets(sched_res, meter_res,
+                                       block_minutes=block_minutes, blocks_per_day=blocks_per_day)
     return merged, warnings
 
 
@@ -318,7 +320,8 @@ if warnings:
 # ---------------------------------------------------------------------------
 st.markdown('<div class="section-header">📊 Summary</div>', unsafe_allow_html=True)
 r1 = st.columns(4)
-r1[0].metric("Total Blocks", summary["Total Blocks"])
+r1[0].metric("Total Blocks", summary["Total Blocks"],
+             help="Full day (block 1..N) — includes any Pending blocks below.")
 r1[1].metric("Total Scheduled Energy", f"{summary['Total Scheduled Energy (MWh)']:.3f} MWh")
 r1[2].metric("Total Actual Energy", f"{summary['Total Actual Energy (MWh)']:.3f} MWh")
 r1[3].metric("Total DSM Penalty", f"₹{summary['Total DSM Penalty (Rs)']:.2f}")
@@ -339,6 +342,21 @@ r3[2].metric(
     help=f"{mpb['Time_Label']} — ₹{mpb['Penalty']:.2f}" if mpb["Block"] is not None else None,
 )
 r3[3].metric("Max Penalty Amount", f"₹{mpb['Penalty']:.2f}")
+
+# Blocks Calculated / Pending / Daily Status / PPA Amount -- a block whose
+# AI Schedule and/or Meter value is missing is never dropped and never
+# treated as zero; it is kept as "Pending" (penalty = null) and shown here
+# separately so it's clear which blocks actually fed into the totals above.
+_status_badge = {
+    "Calculated": "🟢", "Zero Penalty": "🔵", "Partially Calculated": "🟠", "Pending": "⚪",
+}.get(summary["Daily Status"], "⚪")
+r4 = st.columns(4)
+r4[0].metric("Blocks Calculated", summary["Blocks Calculated"])
+r4[1].metric("Blocks Pending", summary["Blocks Pending"],
+             help="Schedule and/or Meter value missing for these blocks — penalty is null, never zero.")
+r4[2].metric("Daily Status", f"{_status_badge} {summary['Daily Status']}")
+r4[3].metric("Total PPA Amount", f"₹{summary['Total PPA Amount (Rs)']:,.2f}",
+             help="Reference only (Scheduled Energy × PPA Rate) — does not affect the DSM penalty.")
 
 # ---------------------------------------------------------------------------
 # Enercast comparison KPIs (only when an Enercast file was uploaded) --
@@ -400,7 +418,10 @@ filtered = result_df.copy()
 if selected_dates:
     filtered = filtered[filtered["Date"].isin(selected_dates)]
 filtered = filtered[(filtered["Block"] >= block_range[0]) & (filtered["Block"] <= block_range[1])]
-filtered = filtered[filtered["Total_Block_Penalty"] >= penalty_threshold]
+# Keep Pending blocks (Total_Block_Penalty is NaN) visible regardless of the
+# min-penalty threshold -- they have no determinate penalty yet, so they
+# should never be silently filtered out the way a real 0-penalty block would.
+filtered = filtered[(filtered["Total_Block_Penalty"] >= penalty_threshold) | filtered["Total_Block_Penalty"].isna()]
 if dev_filter == "Only Over Generation":
     filtered = filtered[filtered["Deviation_Type"] == "Over Generation"]
 elif dev_filter == "Only Under Generation":
@@ -448,13 +469,15 @@ with tab_table:
     display_cols = [
         "Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW", "Deviation_MW",
         "Deviation_%", "Abs_Deviation_%", "Block_Energy_kWh", "Total_Block_Penalty",
-        "Deviation_Type",
+        "Deviation_Type", "Status", "PPA_Amount",
     ]
+    display_cols = [c for c in display_cols if c in filtered.columns]
     table_df = filtered[display_cols].rename(columns={
         "Time_Label": "Time Block", "Scheduled_MW": "Scheduled MW", "Actual_MW": "Actual MW",
         "Deviation_MW": "Deviation MW", "Deviation_%": "Deviation %",
         "Abs_Deviation_%": "Abs Deviation %", "Block_Energy_kWh": "Block Energy (kWh)",
         "Total_Block_Penalty": "Total Penalty (₹)", "Deviation_Type": "Deviation Type",
+        "PPA_Amount": "PPA Amount (₹)",
     })
 
     if search_term:
@@ -492,8 +515,10 @@ with tab_table:
         "Scheduled MW": "{:.3f}", "Actual MW": "{:.3f}", "Deviation MW": "{:.3f}",
         "Deviation %": "{:.2f}%", "Abs Deviation %": "{:.2f}%",
         "Block Energy (kWh)": "{:.1f}", "Total Penalty (₹)": "₹{:.2f}",
-    })
-    st.caption("🔴 Highest penalty block   🟡 Highest absolute deviation block")
+        "PPA Amount (₹)": "₹{:.2f}",
+    }, na_rep="—")
+    st.caption("🔴 Highest penalty block   🟡 Highest absolute deviation block   "
+               "⚪ — = Pending block (schedule/meter data missing, penalty null)")
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with tab_report:
@@ -533,6 +558,12 @@ with tab_report:
             "Enercast Deviation % (Capacity)": "{:+.2f}", "Enercast Penalty (Rs)": "{:.2f}",
         })
 
+    if "PPA_Amount" in result_df.columns:
+        report_df["PPA Amount (Rs)"] = result_df["PPA_Amount"]
+        fmt_dict["PPA Amount (Rs)"] = "{:.2f}"
+    if "Status" in result_df.columns:
+        report_df["Status"] = result_df["Status"]
+
     def _report_style(row):
         styles = [""] * len(row)
         dev = row["Deviation (MW)"]
@@ -543,10 +574,14 @@ with tab_report:
         if row["Penalty (Rs)"] > 0:
             idx = row.index.get_loc("Penalty (Rs)")
             styles[idx] = "color:#C00000; font-weight:700;"
+        if "Status" in row.index and row["Status"] == "Pending":
+            idx = row.index.get_loc("Status")
+            styles[idx] = "color:#B45309; font-weight:700; background-color:#FEF3C7;"
         return styles
 
     styled_report = report_df.style.apply(_report_style, axis=1).format(fmt_dict, na_rep="—")
-    st.caption("🔴 Deviation > 0.5 MW or a block with a penalty   🔵 Deviation ≤ 0.5 MW"
+    st.caption("🔴 Deviation > 0.5 MW or a block with a penalty   🔵 Deviation ≤ 0.5 MW   "
+               "🟠 Pending = schedule/meter data missing for that block (penalty null, not zero)"
                + ("   ⚪ — = no Enercast data for that block" if has_enercast else ""))
     st.dataframe(styled_report, use_container_width=True, hide_index=True, height=420)
 
@@ -574,6 +609,7 @@ with tab_report:
         "mw_signed": lambda v: f"{v:+.3f} MW",
         "pct": lambda v: f"{v:.2f}%",
         "currency": lambda v: f"₹{v:,.2f}",
+        "text": lambda v: str(v),
     }
     m1, m2 = st.columns(2)
     half = (len(metrics) + 1) // 2

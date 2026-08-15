@@ -67,27 +67,43 @@ def compute_block_penalty(abs_dev_pct: float, block_energy_abs_kwh: float, slabs
 
 def evaluate_schedule(merged_df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
     """Take the merged (Date, Block, Time_Label, Scheduled_MW, Actual_MW)
-    dataframe and compute every required DSM column, block by block.
+    dataframe -- which now always spans every block of the day (1..N), with
+    NaN Scheduled_MW/Actual_MW for any block that had no matching data -- and
+    compute every required DSM column, block by block.
+
+    A block with a missing schedule and/or meter value is NEVER converted to
+    zero and NEVER silently skipped: it gets Status="Pending" and every
+    computed column (Deviation, Penalty, ...) is left as NaN ("null") for
+    that block. Only blocks with BOTH a schedule and a meter value get
+    Status="Calculated" and a real (possibly zero) penalty. Under- and
+    over-generation are always charged identically -- this uses the standard
+    absolute-deviation DSM slab logic, never a separate payable/receivable
+    settlement split.
     """
     df = merged_df.copy().reset_index(drop=True)
     capacity = plant.installed_capacity_mw
     block_hours = plant.block_hours
     slabs = plant.dsm_slabs
+    ppa_rate = getattr(plant, "ppa_rate", 0.0)
 
-    df["Deviation_MW"] = df["Actual_MW"] - df["Scheduled_MW"]
-    df["Deviation_%"] = (df["Deviation_MW"] / capacity) * 100.0
-    df["Abs_Deviation_%"] = df["Deviation_%"].abs()
-    df["Block_Energy_kWh"] = df["Deviation_MW"] * block_hours * 1000.0
+    has_sched = df["Scheduled_MW"].notna()
+    has_actual = df["Actual_MW"].notna()
+    is_calculated = has_sched & has_actual
+
+    df["Deviation_MW"] = np.where(is_calculated, df["Actual_MW"] - df["Scheduled_MW"], np.nan)
+    df["Deviation_%"] = np.where(is_calculated, df["Deviation_MW"] / capacity * 100.0, np.nan)
+    df["Abs_Deviation_%"] = np.abs(df["Deviation_%"])
+    df["Block_Energy_kWh"] = np.where(is_calculated, df["Deviation_MW"] * block_hours * 1000.0, np.nan)
 
     energy_cols, penalty_cols = _slab_columns(slabs)
     for c in energy_cols + penalty_cols:
-        df[c] = 0.0
+        df[c] = np.nan
 
-    total_penalty = np.zeros(len(df))
+    total_penalty = np.full(len(df), np.nan)
 
-    for idx, row in df.iterrows():
-        abs_pct = row["Abs_Deviation_%"]
-        energy_abs = abs(row["Block_Energy_kWh"])
+    for idx in df.index[is_calculated]:
+        abs_pct = df.at[idx, "Abs_Deviation_%"]
+        energy_abs = abs(df.at[idx, "Block_Energy_kWh"])
         energies, penalties, tot = compute_block_penalty(abs_pct, energy_abs, slabs)
         for c, v in zip(energy_cols, energies):
             df.at[idx, c] = v
@@ -96,16 +112,25 @@ def evaluate_schedule(merged_df: pd.DataFrame, plant: PlantConfig) -> pd.DataFra
         total_penalty[idx] = tot
 
     df["Total_Block_Penalty"] = total_penalty
-    df["Deviation_Type"] = np.where(
-        df["Deviation_MW"] > 1e-9, "Over Generation",
-        np.where(df["Deviation_MW"] < -1e-9, "Under Generation", "No Deviation"),
+    df["Status"] = np.where(is_calculated, "Calculated", "Pending")
+    df["Deviation_Type"] = np.select(
+        [~is_calculated, df["Deviation_MW"] > 1e-9, df["Deviation_MW"] < -1e-9],
+        ["Pending", "Over Generation", "Under Generation"],
+        default="No Deviation",
     )
+
+    # PPA Amount (Rs) -- display-only reference figure, computed from the
+    # scheduled energy whenever a schedule value exists, independent of
+    # whether meter data has arrived yet for that block. Never affects the
+    # DSM penalty above.
+    scheduled_kwh = df["Scheduled_MW"] * block_hours * 1000.0
+    df["PPA_Amount"] = np.where(has_sched, scheduled_kwh * ppa_rate, np.nan)
 
     ordered_cols = (
         ["Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW",
          "Deviation_MW", "Deviation_%", "Abs_Deviation_%", "Block_Energy_kWh"]
         + energy_cols + penalty_cols
-        + ["Total_Block_Penalty", "Deviation_Type"]
+        + ["Total_Block_Penalty", "Deviation_Type", "Status", "PPA_Amount"]
     )
     if "Generated_At" in df.columns:
         ordered_cols.append("Generated_At")
@@ -137,7 +162,11 @@ def evaluate_enercast(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
     block_hours = plant.block_hours
     slabs = plant.dsm_slabs
 
-    has_enercast = df["Enercast_MW"].notna()
+    # Enercast is graded against the actual meter reading too -- if the meter
+    # value itself is missing (block Pending), there is nothing to compare
+    # Enercast against, so leave it NaN rather than treating the missing
+    # actual as zero.
+    has_enercast = df["Enercast_MW"].notna() & df["Actual_MW"].notna()
     dev_mw = (df["Actual_MW"] - df["Enercast_MW"]).where(has_enercast)
     dev_pct = (dev_mw / capacity * 100.0)
     block_energy = (dev_mw * block_hours * 1000.0)
@@ -161,7 +190,8 @@ def enercast_summary(df: pd.DataFrame) -> Optional[dict]:
     each. Returns None if no Enercast data is present."""
     if "Enercast_MW" not in df.columns:
         return None
-    covered = df[df["Enercast_MW"].notna()]
+    covered = df[df["Enercast_Deviation_MW"].notna()] if "Enercast_Deviation_MW" in df.columns \
+        else df[df["Enercast_MW"].notna() & df["Actual_MW"].notna()]
     n = len(covered)
     if n == 0:
         return None
@@ -174,23 +204,55 @@ def enercast_summary(df: pd.DataFrame) -> Optional[dict]:
     }
 
 
+def compute_daily_status(df: pd.DataFrame) -> str:
+    """Roll up every block's Status into one day-level label:
+
+        No calculated blocks       -> "Pending"
+        Some blocks calculated     -> "Partially Calculated"
+        All calculated, total = 0  -> "Zero Penalty"
+        All calculated, total > 0  -> "Calculated"
+    """
+    if "Status" not in df.columns or len(df) == 0:
+        return "Pending"
+    n_total = len(df)
+    n_calc = int((df["Status"] == "Calculated").sum())
+    if n_calc == 0:
+        return "Pending"
+    if n_calc < n_total:
+        return "Partially Calculated"
+    total_penalty = float(df["Total_Block_Penalty"].sum())
+    return "Zero Penalty" if total_penalty == 0 else "Calculated"
+
+
 def build_summary(df: pd.DataFrame, plant: PlantConfig) -> dict:
     """Compute the KPI summary shown at the top of the dashboard and in the
     Excel 'Summary' sheet.
+
+    "Total Blocks" is the full day (e.g. all 96 blocks), regardless of how
+    many actually had matching data. "Blocks Calculated" / "Blocks Pending"
+    split that total by Status. Every aggregate below (max/min/mean/sum)
+    automatically ignores Pending (NaN) blocks -- pandas skips NaN in these
+    by default -- so a missing block is never treated as a zero deviation or
+    a zero penalty.
     """
     block_hours = plant.block_hours
     total_blocks = len(df)
+    has_status = "Status" in df.columns
+    blocks_calculated = int((df["Status"] == "Calculated").sum()) if has_status else total_blocks
+    blocks_pending = int((df["Status"] == "Pending").sum()) if has_status else 0
+
     total_scheduled_energy_mwh = float((df["Scheduled_MW"] * block_hours).sum())
     total_actual_energy_mwh = float((df["Actual_MW"] * block_hours).sum())
 
-    max_pos_dev = float(df["Deviation_MW"].max()) if total_blocks else 0.0
-    max_neg_dev = float(df["Deviation_MW"].min()) if total_blocks else 0.0
-    avg_dev = float(df["Deviation_MW"].mean()) if total_blocks else 0.0
+    max_pos_dev = float(df["Deviation_MW"].max()) if blocks_calculated else 0.0
+    max_neg_dev = float(df["Deviation_MW"].min()) if blocks_calculated else 0.0
+    avg_dev = float(df["Deviation_MW"].mean()) if blocks_calculated else 0.0
 
     total_penalty = float(df["Total_Block_Penalty"].sum())
-    avg_penalty_per_block = float(df["Total_Block_Penalty"].mean()) if total_blocks else 0.0
+    avg_penalty_per_block = float(df["Total_Block_Penalty"].mean()) if blocks_calculated else 0.0
+    total_ppa_amount = float(df["PPA_Amount"].sum()) if "PPA_Amount" in df.columns else 0.0
 
-    if total_blocks and df["Total_Block_Penalty"].max() > 0:
+    if blocks_calculated and df["Total_Block_Penalty"].notna().any() and df["Total_Block_Penalty"].max() > 0:
         max_pen_idx = df["Total_Block_Penalty"].idxmax()
         max_penalty_block = {
             "Block": int(df.loc[max_pen_idx, "Block"]),
@@ -208,6 +270,9 @@ def build_summary(df: pd.DataFrame, plant: PlantConfig) -> dict:
         "Plant Name": plant.name,
         "Installed Capacity (MW)": plant.installed_capacity_mw,
         "Total Blocks": total_blocks,
+        "Blocks Calculated": blocks_calculated,
+        "Blocks Pending": blocks_pending,
+        "Daily Status": compute_daily_status(df),
         "Total Scheduled Energy (MWh)": total_scheduled_energy_mwh,
         "Total Actual Energy (MWh)": total_actual_energy_mwh,
         "Energy Deviation (MWh)": total_actual_energy_mwh - total_scheduled_energy_mwh,
@@ -220,6 +285,7 @@ def build_summary(df: pd.DataFrame, plant: PlantConfig) -> dict:
         "Maximum Penalty Block": max_penalty_block,
         "Total DSM Penalty (Rs)": total_penalty,
         "Average Penalty per Block (Rs)": avg_penalty_per_block,
+        "Total PPA Amount (Rs)": total_ppa_amount,
     }
 
 
@@ -231,16 +297,24 @@ def day_summary_metrics(df: pd.DataFrame, plant: PlantConfig) -> list:
     Returns a list of dicts: {label, value, kind} where kind is one of
     'int' | 'mw' | 'mw_signed' | 'pct' | 'currency'.
     """
-    n = len(df)
-    dev = df["Deviation_MW"].to_numpy() if n else np.array([])
-    pen = df["Total_Block_Penalty"].to_numpy() if n else np.array([])
+    has_status = "Status" in df.columns
+    calc_df = df[df["Status"] == "Calculated"] if has_status else df
+    n = len(calc_df)
+    n_total = len(df)
+    n_pending = n_total - n if has_status else 0
+    dev = calc_df["Deviation_MW"].to_numpy() if n else np.array([])
+    pen = calc_df["Total_Block_Penalty"].to_numpy() if n else np.array([])
     cap = plant.installed_capacity_mw
+    total_ppa = float(df["PPA_Amount"].sum()) if "PPA_Amount" in df.columns else 0.0
 
     return [
         {"label": "Blocks with a real meter reading", "value": float(n), "kind": "int"},
+        {"label": "Blocks Pending (schedule and/or meter missing)",
+         "value": float(n_pending), "kind": "int"},
+        {"label": "Daily Status", "value": compute_daily_status(df), "kind": "text"},
         {"label": "Total scheduled (MW, scored blocks)",
-         "value": float(df["Scheduled_MW"].sum()) if n else 0.0, "kind": "mw"},
-        {"label": "Total actual (MW)", "value": float(df["Actual_MW"].sum()) if n else 0.0, "kind": "mw"},
+         "value": float(calc_df["Scheduled_MW"].sum()) if n else 0.0, "kind": "mw"},
+        {"label": "Total actual (MW)", "value": float(calc_df["Actual_MW"].sum()) if n else 0.0, "kind": "mw"},
         {"label": "Total deviation — actual minus scheduled (MW)",
          "value": float(dev.sum()) if n else 0.0, "kind": "mw_signed"},
         {"label": "Mean absolute deviation (MW)",
@@ -259,4 +333,6 @@ def day_summary_metrics(df: pd.DataFrame, plant: PlantConfig) -> list:
          "value": float(pen.max()) if n else 0.0, "kind": "currency"},
         {"label": "TOTAL DSM PENALTY FOR THE DAY (Rs)",
          "value": float(pen.sum()) if n else 0.0, "kind": "currency"},
+        {"label": "Total PPA Amount (Rs, reference only)",
+         "value": total_ppa, "kind": "currency"},
     ]

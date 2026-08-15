@@ -273,69 +273,87 @@ def parse_energy_file(
 # Merge schedule + meter data
 # ---------------------------------------------------------------------------
 def merge_datasets(
-    schedule_result: ParseResult, meter_result: ParseResult
+    schedule_result: ParseResult, meter_result: ParseResult,
+    block_minutes: int = 15, blocks_per_day: int = 96,
 ) -> Tuple[pd.DataFrame, List[str]]:
+    """Match the AI Schedule and Meter Data files block-by-block.
+
+    IMPORTANT: every block from 1..blocks_per_day is always present in the
+    returned dataframe (for every date found in the files) -- a block whose
+    schedule and/or meter value is missing is NEVER dropped and NEVER
+    silently treated as zero. It is kept as a row with NaN in
+    Scheduled_MW/Actual_MW; calculator.evaluate_schedule() marks such rows
+    Status="Pending" (penalty = null) rather than computing a (wrong) number
+    for them.
+    """
     warnings = list(schedule_result.warnings) + list(meter_result.warnings)
 
     sched = schedule_result.df.copy()
     meter = meter_result.df.copy()
 
     use_date = schedule_result.has_date and meter_result.has_date
-    keys = ["Date", "Block"] if use_date else ["Block"]
-
     if not use_date:
         warnings.append(
             "Matching performed on Block number only (date missing from one or both files)."
         )
-        sched = sched.drop(columns=["Date"])
-        meter = meter.drop(columns=["Date"])
+        sched = sched.drop(columns=["Date"], errors="ignore")
+        meter = meter.drop(columns=["Date"], errors="ignore")
 
-    merged = pd.merge(
-        sched, meter, on=keys, how="outer", suffixes=("", "_meter"),
-        indicator=True,
+    # Build the full day's block skeleton (1..blocks_per_day) for every date
+    # seen in either file, so every possible block is represented -- even
+    # ones neither file has any data for at all.
+    if use_date:
+        dates = sorted(set(sched["Date"].dropna().unique()) | set(meter["Date"].dropna().unique()))
+        if not dates:
+            dates = [None]
+    else:
+        dates = [None]
+
+    blocks_per_day = max(1, int(blocks_per_day))
+    skeleton = pd.DataFrame(
+        [
+            {"Date": d, "Block": b, "Time_Label": block_time_label(b, block_minutes)}
+            for d in dates for b in range(1, blocks_per_day + 1)
+        ]
     )
+    if not use_date:
+        skeleton = skeleton.drop(columns=["Date"])
 
-    only_sched = int((merged["_merge"] == "left_only").sum())
-    only_meter = int((merged["_merge"] == "right_only").sum())
-    if only_sched:
-        warnings.append(
-            f"{only_sched} block(s) present in the AI Schedule file had no matching "
-            f"Meter Data and were excluded from the DSM calculation."
-        )
-    if only_meter:
-        warnings.append(
-            f"{only_meter} block(s) present in the Meter Data file had no matching "
-            f"AI Schedule and were excluded from the DSM calculation."
-        )
+    keys = ["Date", "Block"] if use_date else ["Block"]
 
-    merged = merged[merged["_merge"] == "both"].drop(columns=["_merge"])
+    # Drop each source's own Time_Label -- the skeleton's is authoritative
+    # for EVERY block (including ones neither file covers).
+    sched_slim = sched.drop(columns=["Time_Label"], errors="ignore")
+    meter_slim = meter.drop(columns=["Time_Label"], errors="ignore")
 
-    if merged.empty:
+    merged = skeleton.merge(sched_slim, on=keys, how="left")
+    merged = merged.merge(meter_slim, on=keys, how="left", suffixes=("", "_meter"))
+
+    if "Date" not in merged.columns:
+        merged["Date"] = None
+
+    merged = merged.sort_values(["Block"] if not use_date else ["Date", "Block"]).reset_index(drop=True)
+
+    # final sanity: numeric coercion (NaN stays NaN -- never filled with 0)
+    merged["Scheduled_MW"] = pd.to_numeric(merged["Scheduled_MW"], errors="coerce")
+    merged["Actual_MW"] = pd.to_numeric(merged["Actual_MW"], errors="coerce")
+
+    missing_sched = merged["Scheduled_MW"].isna()
+    missing_meter = merged["Actual_MW"].isna()
+    n_pending = int((missing_sched | missing_meter).sum())
+    n_calculated = int((~missing_sched & ~missing_meter).sum())
+
+    if n_calculated == 0:
         raise FileValidationError(
             "No matching blocks were found between the AI Schedule and Meter Data files. "
             "Please check that both files cover the same date and use the same block numbering."
         )
 
-    if "Time_Label" not in merged.columns and "Time_Label_meter" in merged.columns:
-        merged["Time_Label"] = merged["Time_Label_meter"]
-    if "Time_Label_meter" in merged.columns:
-        merged = merged.drop(columns=["Time_Label_meter"])
-
-    if "Date" not in merged.columns:
-        merged["Date"] = None
-
-    merged = merged.sort_values(["Block"]).reset_index(drop=True)
-
-    # final sanity: numeric coercion
-    merged["Scheduled_MW"] = pd.to_numeric(merged["Scheduled_MW"], errors="coerce")
-    merged["Actual_MW"] = pd.to_numeric(merged["Actual_MW"], errors="coerce")
-    n_missing = int(merged[["Scheduled_MW", "Actual_MW"]].isna().any(axis=1).sum())
-    if n_missing:
+    if n_pending:
         warnings.append(
-            f"{n_missing} block(s) had missing numeric values and were dropped before "
-            f"penalty calculation."
+            f"{n_pending} of {len(merged)} block(s) had missing AI Schedule and/or Meter "
+            f"data — kept as 'Pending' (penalty = null, never treated as zero)."
         )
-        merged = merged.dropna(subset=["Scheduled_MW", "Actual_MW"])
 
     cols = ["Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW"]
     if "Generated_At" in merged.columns:

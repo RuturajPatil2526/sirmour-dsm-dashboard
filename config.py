@@ -46,6 +46,10 @@ class PlantConfig:
     block_minutes: int = 15
     dsm_slabs: List[DSMSlab] = field(default_factory=list)
     currency_symbol: str = "₹"  # ₹
+    # PPA (Power Purchase Agreement) rate, Rs/kWh -- used ONLY to display a
+    # reference "PPA Amount" per block (scheduled energy x this rate). It
+    # never affects the DSM penalty calculation itself.
+    ppa_rate: float = 0.0
 
     @property
     def block_hours(self) -> float:
@@ -75,6 +79,7 @@ PLANT_CONFIGS: Dict[str, PlantConfig] = {
         installed_capacity_mw=5.1,
         block_minutes=15,
         dsm_slabs=DEFAULT_SLABS,
+        ppa_rate=2.94,
     ),
 }
 
