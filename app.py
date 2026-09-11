@@ -24,7 +24,10 @@ from utils import (
     parse_energy_file, merge_datasets, FileValidationError,
     parse_enercast_file, merge_enercast,
 )
-from calculator import evaluate_schedule, build_summary, day_summary_metrics, evaluate_enercast, enercast_summary
+from calculator import (
+    evaluate_schedule, build_summary, day_summary_metrics, evaluate_enercast, enercast_summary,
+    evaluate_step1, step1_summary,
+)
 from graphs import all_figures
 from excel_export import build_excel_report
 
@@ -173,7 +176,10 @@ with st.sidebar:
     st.markdown("## 📂 Upload Data")
     schedule_file = st.file_uploader(
         "AI Schedule File (Predicted Generation)", type=["csv", "xlsx", "xls"],
-        help="Must contain Date/Time and Predicted MW (or kW) for each block.",
+        help="Must contain Date/Time and Predicted MW (or kW) for each block. "
+             "The 2-step format (Step 1 'Meter Base Forecast MW' + Step 2 "
+             "'Weather Adjustment MW') is also auto-detected — Step 2 becomes "
+             "the official schedule, and Step 1 is penalised separately for comparison.",
     )
     meter_file = st.file_uploader(
         "Meter Data File (Actual Generation)", type=["csv", "xlsx", "xls"],
@@ -261,6 +267,13 @@ if process_clicked or "result_df" in st.session_state:
                     tuple((s.lower, s.upper, s.rate) for s in plant.dsm_slabs),
                 )
                 result_df = evaluate_schedule(merged, plant)
+
+                # Step 1 (base forecast, before weather adjustment) is only
+                # present when the AI Schedule file used the 2-step format.
+                # It is comparison-only -- Total_Block_Penalty above is
+                # always graded against Step 2 (the official, weather-
+                # adjusted schedule), never against Step 1.
+                result_df = evaluate_step1(result_df, plant)
 
                 # Enercast is entirely optional and comparison-only -- it
                 # never touches result_df's own Scheduled_MW/Deviation/
@@ -386,6 +399,33 @@ if "Enercast_MW" in result_df.columns:
         )
 
 # ---------------------------------------------------------------------------
+# Step 1 vs Step 2 comparison KPIs (only when the AI Schedule file used the
+# 2-step format) -- Step 2 (weather-adjusted) is the official schedule
+# graded above; Step 1 (base forecast) is penalised separately, purely for
+# comparison, so the value the weather-adjustment step adds is visible here.
+# ---------------------------------------------------------------------------
+if "Step1_MW" in result_df.columns:
+    s1_summary_top = step1_summary(result_df)
+    if s1_summary_top:
+        st.markdown(
+            '<div class="section-header" style="font-size:1.05rem;">🌦️ Step 2 (official) vs Step 1 (base forecast)</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "🩷 Step 1 (meter-base forecast, before weather adjustment) is shown only for comparison — "
+            "the official AI Schedule and Total DSM Penalty above are always Step 2 (weather-adjusted)."
+        )
+        rs1, rs2, rs3, rs4 = st.columns(4)
+        rs1.metric("Blocks Compared", s1_summary_top["Blocks compared"])
+        rs2.metric("Step 2 Penalty (same blocks)", f"₹{s1_summary_top['Step 2 (official) Total Penalty (Rs, same blocks)']:.2f}")
+        rs3.metric("Step 1 Penalty", f"₹{s1_summary_top['Step 1 (base forecast) Total Penalty (Rs)']:.2f}")
+        rs4.metric(
+            "Step 2 Mean Abs Deviation", f"{s1_summary_top['Step 2 Mean Abs Deviation (MW)']:.3f} MW",
+            delta=f"{s1_summary_top['Step 2 Mean Abs Deviation (MW)'] - s1_summary_top['Step 1 Mean Abs Deviation (MW)']:+.3f} MW vs Step 1",
+            delta_color="inverse",
+        )
+
+# ---------------------------------------------------------------------------
 # Filters
 # ---------------------------------------------------------------------------
 st.markdown('<div class="section-header">🔍 Filters</div>', unsafe_allow_html=True)
@@ -448,6 +488,12 @@ with tab_charts:
                 "🔵 Enercast is plotted alongside for comparison on every chart below — "
                 "our own forecast is still graded against actual meter data only, never against Enercast."
             )
+        if "Step1_MW" in filtered.columns:
+            st.caption(
+                "🩷 Step 1 (base forecast, before weather adjustment) is plotted alongside Step 2 "
+                "(the official, weather-adjusted schedule) for comparison — each is penalised "
+                "independently against actual meter data."
+            )
         figs = all_figures(filtered)
         c1, c2 = st.columns(2)
         with c1:
@@ -470,14 +516,17 @@ with tab_table:
         "Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW", "Deviation_MW",
         "Deviation_%", "Abs_Deviation_%", "Block_Energy_kWh", "Total_Block_Penalty",
         "Deviation_Type", "Status", "PPA_Amount",
+        "Step1_MW", "Step1_Deviation_MW", "Step1_Penalty",
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
     table_df = filtered[display_cols].rename(columns={
-        "Time_Label": "Time Block", "Scheduled_MW": "Scheduled MW", "Actual_MW": "Actual MW",
+        "Time_Label": "Time Block", "Scheduled_MW": "Scheduled MW (Step 2)", "Actual_MW": "Actual MW",
         "Deviation_MW": "Deviation MW", "Deviation_%": "Deviation %",
         "Abs_Deviation_%": "Abs Deviation %", "Block_Energy_kWh": "Block Energy (kWh)",
         "Total_Block_Penalty": "Total Penalty (₹)", "Deviation_Type": "Deviation Type",
         "PPA_Amount": "PPA Amount (₹)",
+        "Step1_MW": "Step 1 MW", "Step1_Deviation_MW": "Step 1 Deviation MW",
+        "Step1_Penalty": "Step 1 Penalty (₹)",
     })
 
     if search_term:
@@ -512,10 +561,11 @@ with tab_table:
         return styles
 
     styled = page_df.style.apply(_highlight, axis=1).format({
-        "Scheduled MW": "{:.3f}", "Actual MW": "{:.3f}", "Deviation MW": "{:.3f}",
+        "Scheduled MW (Step 2)": "{:.3f}", "Actual MW": "{:.3f}", "Deviation MW": "{:.3f}",
         "Deviation %": "{:.2f}%", "Abs Deviation %": "{:.2f}%",
         "Block Energy (kWh)": "{:.1f}", "Total Penalty (₹)": "₹{:.2f}",
         "PPA Amount (₹)": "₹{:.2f}",
+        "Step 1 MW": "{:.3f}", "Step 1 Deviation MW": "{:.3f}", "Step 1 Penalty (₹)": "₹{:.2f}",
     }, na_rep="—")
     st.caption("🔴 Highest penalty block   🟡 Highest absolute deviation block   "
                "⚪ — = Pending block (schedule/meter data missing, penalty null)")
@@ -523,6 +573,7 @@ with tab_table:
 
 with tab_report:
     has_enercast = "Enercast_MW" in result_df.columns
+    has_step1 = "Step1_MW" in result_df.columns
     st.caption(
         "This mirrors the exact layout of the downloadable Excel report "
         "(\"Schedule vs Meter + Penalty\") — the full day's data, not affected "
@@ -530,6 +581,10 @@ with tab_report:
         + (" Enercast is shown alongside for comparison only — our forecast is "
            "graded against actual meter data, never against Enercast."
            if has_enercast else "")
+        + (" Step 1 (base forecast, before weather adjustment) is shown alongside "
+           "for comparison only — the official schedule and Total DSM Penalty are "
+           "always Step 2 (weather-adjusted)."
+           if has_step1 else "")
     )
 
     report_cols = ["Block", "Time_Label", "Scheduled_MW", "Actual_MW",
@@ -556,6 +611,16 @@ with tab_report:
         fmt_dict.update({
             "Enercast (MW)": "{:.3f}", "Enercast Deviation (MW)": "{:+.3f}",
             "Enercast Deviation % (Capacity)": "{:+.2f}", "Enercast Penalty (Rs)": "{:.2f}",
+        })
+
+    if has_step1:
+        report_df["Step 1 Forecast (MW)"] = result_df["Step1_MW"]
+        report_df["Step 1 Deviation (MW)"] = result_df["Step1_Deviation_MW"]
+        report_df["Step 1 Deviation % (Capacity)"] = result_df["Step1_Deviation_%"]
+        report_df["Step 1 Penalty (Rs)"] = result_df["Step1_Penalty"]
+        fmt_dict.update({
+            "Step 1 Forecast (MW)": "{:.3f}", "Step 1 Deviation (MW)": "{:+.3f}",
+            "Step 1 Deviation % (Capacity)": "{:+.2f}", "Step 1 Penalty (Rs)": "{:.2f}",
         })
 
     if "PPA_Amount" in result_df.columns:
@@ -598,6 +663,21 @@ with tab_report:
             ec3.metric("Enercast Penalty", f"₹{e_summary['Enercast Total Penalty (Rs)']:.2f}")
             ec4.metric("Our Mean Abs Deviation", f"{e_summary['Our Mean Abs Deviation (MW)']:.3f} MW",
                        delta=f"{e_summary['Our Mean Abs Deviation (MW)'] - e_summary['Enercast Mean Abs Deviation (MW)']:+.3f} MW vs Enercast",
+                       delta_color="inverse")
+
+    if has_step1:
+        s1_summary = step1_summary(result_df)
+        if s1_summary:
+            st.markdown(
+                '<div class="section-header" style="font-size:1.05rem;">🌦️ Step 2 (official) vs Step 1 (base forecast)</div>',
+                unsafe_allow_html=True,
+            )
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Blocks compared", s1_summary["Blocks compared"])
+            sc2.metric("Step 2 Penalty (same blocks)", f"₹{s1_summary['Step 2 (official) Total Penalty (Rs, same blocks)']:.2f}")
+            sc3.metric("Step 1 Penalty", f"₹{s1_summary['Step 1 (base forecast) Total Penalty (Rs)']:.2f}")
+            sc4.metric("Step 2 Mean Abs Deviation", f"{s1_summary['Step 2 Mean Abs Deviation (MW)']:.3f} MW",
+                       delta=f"{s1_summary['Step 2 Mean Abs Deviation (MW)'] - s1_summary['Step 1 Mean Abs Deviation (MW)']:+.3f} MW vs Step 1",
                        delta_color="inverse")
 
     st.markdown('<div class="section-header" style="font-size:1.05rem;">📑 Day Summary — Accuracy and DSM Penalty</div>',

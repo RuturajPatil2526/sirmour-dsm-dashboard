@@ -116,6 +116,22 @@ def find_column(df: pd.DataFrame, category: str) -> Optional[str]:
     return None
 
 
+_TIME_RANGE_SUFFIX = re.compile(r"\s*-\s*\d{1,2}:\d{2}(:\d{2})?\s*$")
+
+
+def _clean_timestamp_series(raw: pd.Series) -> pd.Series:
+    """Strip a trailing '- HH:MM' (or '- HH:MM:SS') range-end suffix from a
+    timestamp-like column before parsing, e.g. '2026-09-11 05:15 - 05:30'
+    (a "Time Interval" column marking a block's start AND end) becomes
+    '2026-09-11 05:15', which pandas can parse. A plain single timestamp
+    with no such suffix passes through unchanged. Only touches string/object
+    columns -- a column that's already datetime-typed is returned as-is.
+    """
+    if not pd.api.types.is_object_dtype(raw) and not pd.api.types.is_string_dtype(raw):
+        return raw
+    return raw.astype(str).str.replace(_TIME_RANGE_SUFFIX, "", regex=True)
+
+
 def _extract_block_number(value) -> Optional[int]:
     if pd.isna(value):
         return None
@@ -155,15 +171,44 @@ def parse_energy_file(
     col_ts = find_column(df_raw, "timestamp")
     col_val_mw = find_column(df_raw, value_category)
     col_val_kw = find_column(df_raw, value_kw_category)
+    # 2-step AI Schedule format (only relevant for the schedule file itself).
+    col_step1 = find_column(df_raw, "mw_step1") if role == "schedule" else None
+    col_step2 = find_column(df_raw, "mw_step2") if role == "schedule" else None
 
     detected = {
         "date": col_date, "block": col_block, "timestamp": col_ts,
         "value_mw": col_val_mw, "value_kw": col_val_kw,
+        "step1_mw": col_step1, "step2_mw": col_step2,
     }
 
     # -- value column -------------------------------------------------
     value_series = None
-    if col_val_mw is not None:
+    step1_series = None
+    if col_step1 is not None or col_step2 is not None:
+        # New 2-step format: "Step 1 Meter Base Forecast MW" (base forecast)
+        # + "Step 2 Weather Adjustment MW" (final, weather-adjusted
+        # forecast). Step 2 becomes the official Scheduled_MW that drives
+        # the main DSM report; Step 1 is carried alongside as its own
+        # separately-penalised comparison column (see calculator.
+        # evaluate_step1) -- exactly like Enercast, but sourced from the
+        # same file. If only one of the two is present, it is used as the
+        # official schedule on its own.
+        if col_step2 is not None:
+            value_series = pd.to_numeric(df_raw[col_step2], errors="coerce")
+            detected["value_mw"] = col_step2
+        else:
+            value_series = pd.to_numeric(df_raw[col_step1], errors="coerce")
+            detected["value_mw"] = col_step1
+        if col_step1 is not None and col_step2 is not None:
+            step1_series = pd.to_numeric(df_raw[col_step1], errors="coerce")
+            warnings.append(
+                f"{label}: detected 2-step AI Schedule format — using "
+                f"'{col_step2}' (Step 2, weather-adjusted) as the official "
+                f"schedule, and '{col_step1}' (Step 1, base forecast) as a "
+                f"separate comparison-only schedule. Each is penalised "
+                f"independently against actual meter data."
+            )
+    elif col_val_mw is not None:
         value_series = pd.to_numeric(df_raw[col_val_mw], errors="coerce")
     elif col_val_kw is not None:
         value_series = pd.to_numeric(df_raw[col_val_kw], errors="coerce") / 1000.0
@@ -199,7 +244,19 @@ def parse_energy_file(
         if col_date is not None:
             date_series = pd.to_datetime(df_raw[col_date], errors="coerce").dt.date
         elif col_ts is not None:
-            date_series = pd.to_datetime(df_raw[col_ts], errors="coerce").dt.date
+            date_series = pd.to_datetime(_clean_timestamp_series(df_raw[col_ts]), errors="coerce").dt.date
+            if date_series.isna().all():
+                # The timestamp column couldn't be parsed at all (e.g. an
+                # unrecognised format) -- fall back to Block-only matching
+                # rather than silently merging on a column that's entirely
+                # NaT, which would otherwise raise a confusing dtype error
+                # downstream in merge_datasets().
+                date_series = pd.Series([None] * len(df_raw))
+                has_date = False
+                warnings.append(
+                    f"{label}: could not parse dates from column '{col_ts}' — "
+                    f"matching will be done on Block number only."
+                )
         else:
             date_series = pd.Series([None] * len(df_raw))
             has_date = False
@@ -207,7 +264,7 @@ def parse_energy_file(
                 f"{label}: no date column found — matching will be done on Block number only."
             )
     elif col_ts is not None:
-        ts_series = pd.to_datetime(df_raw[col_ts], errors="coerce")
+        ts_series = pd.to_datetime(_clean_timestamp_series(df_raw[col_ts]), errors="coerce")
         if ts_series.isna().all():
             raise FileValidationError(
                 f"Could not parse any timestamps in column '{col_ts}' of the {label} file."
@@ -243,6 +300,8 @@ def parse_energy_file(
         detected["generated_at"] = col_gen_at
         if col_gen_at is not None:
             data["Generated_At"] = df_raw[col_gen_at].astype(str)
+        if step1_series is not None:
+            data["Step1_MW"] = step1_series
 
     out = pd.DataFrame(data)
 
@@ -337,6 +396,8 @@ def merge_datasets(
     # final sanity: numeric coercion (NaN stays NaN -- never filled with 0)
     merged["Scheduled_MW"] = pd.to_numeric(merged["Scheduled_MW"], errors="coerce")
     merged["Actual_MW"] = pd.to_numeric(merged["Actual_MW"], errors="coerce")
+    if "Step1_MW" in merged.columns:
+        merged["Step1_MW"] = pd.to_numeric(merged["Step1_MW"], errors="coerce")
 
     missing_sched = merged["Scheduled_MW"].isna()
     missing_meter = merged["Actual_MW"].isna()
@@ -356,6 +417,8 @@ def merge_datasets(
         )
 
     cols = ["Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW"]
+    if "Step1_MW" in merged.columns:
+        cols.append("Step1_MW")
     if "Generated_At" in merged.columns:
         cols.append("Generated_At")
     merged = merged[cols]

@@ -108,6 +108,27 @@ COLUMN_ALIASES = {
         "scheduled_mw", "scheduled (mw)", "scheduled mw", "forecast_mw",
         "forecast (mw)",
     ],
+    # New 2-step AI Schedule format: "Step 1 Meter Base Forecast MW" (the
+    # raw meter-based forecast, before any weather adjustment) and
+    # "Step 2 Weather Adjustment MW" (the final, weather-adjusted forecast
+    # that is actually submitted as the schedule). When both are present,
+    # Step 2 becomes the official Scheduled_MW and Step 1 is kept alongside
+    # as its own, separately-penalised comparison column (see utils.py /
+    # calculator.evaluate_step1).
+    "mw_step1": [
+        "step 1 meter base forecast mw", "step 1 meter base forecast (mw)",
+        "step1 meter base forecast mw", "step 1 meter base forecast",
+        "meter base forecast mw", "meter base forecast (mw)",
+        "step 1 mw", "step1 mw", "step 1 (mw)", "step1_mw",
+        "base forecast mw", "base forecast (mw)",
+    ],
+    "mw_step2": [
+        "step 2 weather adjustment mw", "step 2 weather adjustment (mw)",
+        "step2 weather adjustment mw", "step 2 weather adjustment",
+        "weather adjustment mw", "weather adjustment (mw)",
+        "step 2 mw", "step2 mw", "step 2 (mw)", "step2_mw",
+        "weather adjusted mw", "weather adjusted (mw)",
+    ],
     "kw_predicted": [
         "predicted_kw", "predicted (kw)", "predicted kw",
         "ai schedule (kw)", "schedule_kw", "scheduled_kw", "forecast_kw",

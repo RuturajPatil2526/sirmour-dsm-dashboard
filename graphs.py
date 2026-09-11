@@ -25,6 +25,7 @@ COLOR_PENALTY = "#7C3AED"     # violet (kept distinct so penalty stands out)
 COLOR_CUMULATIVE = "#0F766E"  # teal-green
 COLOR_NEUTRAL = "#64748B"     # slate
 COLOR_ENERCAST = "#2563EB"    # blue (third-party Enercast comparison series)
+COLOR_STEP1 = "#DB2777"       # pink/magenta (Step 1 base-forecast comparison series)
 
 TEMPLATE = "plotly_white"
 
@@ -69,6 +70,15 @@ def fig_actual_vs_predicted(df: pd.DataFrame) -> go.Figure:
             hovertemplate="Block %{x} (%{hovertext})<br>Enercast: %{y:.3f} MW<extra></extra>",
             connectgaps=False,
         ))
+    if "Step1_MW" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["Block"], y=df["Step1_MW"], mode="lines+markers",
+            name="Step 1 (Base Forecast) MW",
+            line=dict(color=COLOR_STEP1, width=2, dash="dash"), marker=dict(size=4),
+            hovertext=df["Time_Label"],
+            hovertemplate="Block %{x} (%{hovertext})<br>Step 1 (Base Forecast): %{y:.3f} MW<extra></extra>",
+            connectgaps=False,
+        ))
     fig.update_layout(
         title="Actual vs Predicted Generation (per 15-min Block)",
         xaxis_title="Block Number", yaxis_title="MW", template=TEMPLATE,
@@ -93,6 +103,14 @@ def fig_deviation_bar(df: pd.DataFrame) -> go.Figure:
             hovertemplate="Block %{x} (%{hovertext})<br>Enercast Deviation: %{y:.3f} MW<extra></extra>",
             connectgaps=False,
         ))
+    if "Step1_Deviation_MW" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["Block"], y=df["Step1_Deviation_MW"], mode="lines+markers",
+            name="Step 1 Deviation (MW)", line=dict(color=COLOR_STEP1, width=2, dash="dash"),
+            marker=dict(size=4), hovertext=df["Time_Label"],
+            hovertemplate="Block %{x} (%{hovertext})<br>Step 1 Deviation: %{y:.3f} MW<extra></extra>",
+            connectgaps=False,
+        ))
     fig.add_hline(y=0, line_color=COLOR_NEUTRAL, line_width=1)
     fig.update_layout(
         title="Deviation (MW) by Block", xaxis_title="Block Number",
@@ -113,6 +131,13 @@ def fig_penalty_bar(df: pd.DataFrame) -> go.Figure:
             x=df["Block"], y=df["Enercast_Penalty"], marker_color=COLOR_ENERCAST,
             name="Enercast Penalty (Rs)", hovertext=df["Time_Label"],
             hovertemplate="Block %{x} (%{hovertext})<br>Enercast Penalty: Rs %{y:,.2f}<extra></extra>",
+        ))
+        fig.update_layout(barmode="group")
+    if "Step1_Penalty" in df.columns:
+        fig.add_trace(go.Bar(
+            x=df["Block"], y=df["Step1_Penalty"], marker_color=COLOR_STEP1,
+            name="Step 1 Penalty (Rs)", hovertext=df["Time_Label"],
+            hovertemplate="Block %{x} (%{hovertext})<br>Step 1 Penalty: Rs %{y:,.2f}<extra></extra>",
         ))
         fig.update_layout(barmode="group")
     fig.update_layout(
@@ -138,6 +163,14 @@ def fig_cumulative_penalty(df: pd.DataFrame) -> go.Figure:
             line=dict(color=COLOR_ENERCAST, width=2, dash="dot"), marker=dict(size=4),
             hovertext=df["Time_Label"],
             hovertemplate="Block %{x} (%{hovertext})<br>Enercast Cumulative Penalty: Rs %{y:,.2f}<extra></extra>",
+        ))
+    if "Step1_Penalty" in df.columns:
+        s1_cum = df["Step1_Penalty"].fillna(0).cumsum()
+        fig.add_trace(go.Scatter(
+            x=df["Block"], y=s1_cum, mode="lines+markers", name="Step 1 Cumulative Penalty",
+            line=dict(color=COLOR_STEP1, width=2, dash="dash"), marker=dict(size=4),
+            hovertext=df["Time_Label"],
+            hovertemplate="Block %{x} (%{hovertext})<br>Step 1 Cumulative Penalty: Rs %{y:,.2f}<extra></extra>",
         ))
     fig.update_layout(
         title="Cumulative DSM Penalty Through the Day", xaxis_title="Block Number",
