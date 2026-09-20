@@ -61,6 +61,7 @@ BORDER_GRAY = "#BFBFBF"
 INPUT_BLUE = "#0000FF"
 COLOR_ENERCAST = "#2563EB"  # blue -- Enercast comparison series on charts (matches graphs.py)
 COLOR_STEP1 = "#DB2777"     # pink/magenta -- Step 1 comparison series on charts (matches graphs.py)
+COLOR_STEP2 = "#9333EA"     # purple -- Step 2 comparison series on charts (matches graphs.py)
 
 HEADERS = [
     "Block", "Time", "AI Schedule (MW)", "Actual (MW)", "Deviation (MW)",
@@ -81,25 +82,28 @@ ENERCAST_NOTE = (
     "graded against actual meter data, never against Enercast."
 )
 
-# Optional columns added only when the AI Schedule file used the 2-step
-# format ("Step 1 Meter Base Forecast MW" + "Step 2 Weather Adjustment MW").
-# Step 2 (weather-adjusted) is the official schedule used throughout the
-# report above (columns C-G); Step 1 (base forecast, before weather
-# adjustment) is penalised separately here, comparison-only, so the value
-# the weather-adjustment step adds can be seen directly. Placed right after
-# the Enercast columns (if present) so both optional blocks stay contiguous
-# and every other hardcoded column reference in this module is unaffected.
-STEP1_HEADERS = [
-    "Step 1 Forecast (MW)", "Step 1 Deviation (MW)",
-    "Step 1 Deviation % (Capacity)", "Step 1 Penalty (Rs)",
-]
-STEP1_COL_WIDTHS = [16, 18, 20, 15]
-STEP1_NOTE = (
-    " Step 1 (meter-base forecast, before weather adjustment) is shown "
-    "alongside for comparison — the official AI Schedule is Step 2 "
-    "(weather-adjusted); Step 1 is penalised separately, purely for "
-    "reference, against the same actual meter data."
-)
+# Optional column groups added only when the AI Schedule file used the
+# multi-step format ("Step 1 Meter Base Forecast MW" -> "Step 2 Weather
+# Adjustment MW" -> "Step 3 Plant Profile Adjustment MW"). Whichever stage
+# is LAST (highest-numbered) present is the official schedule used
+# throughout the report above (columns C-G); every earlier stage that's
+# also present gets its own 4 columns here, penalised separately,
+# comparison-only, so the value each later stage adds can be seen directly.
+# Appended right after the Enercast columns (if present), in stage order,
+# so both optional blocks stay contiguous and every other hardcoded column
+# reference in this module (C/D/E/F/G, I/J/K/L for Enercast) is unaffected.
+STEP_COLOR = {1: COLOR_STEP1, 2: COLOR_STEP2}
+
+
+def _stage_headers(n: int) -> List[str]:
+    return [
+        f"Step {n} Forecast (MW)", f"Step {n} Deviation (MW)",
+        f"Step {n} Deviation % (Capacity)", f"Step {n} Penalty (Rs)",
+    ]
+
+
+STAGE_COL_WIDTHS = [16, 18, 20, 15]
+STAGE_STEP_NAMES = {1: "Step 1 (meter-base forecast)", 2: "Step 2 (weather-adjusted forecast)"}
 
 # Always-present trailing columns: PPA Amount (display-only reference figure)
 # and Status (Calculated / Pending). Appended LAST (after Enercast, if
@@ -135,36 +139,39 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
 
     n = len(block_df)
     has_enercast = "Enercast_MW" in block_df.columns
-    has_step1 = "Step1_MW" in block_df.columns
     has_status = "Status" in block_df.columns
-    headers = (
-        HEADERS + (ENERCAST_HEADERS if has_enercast else [])
-        + (STEP1_HEADERS if has_step1 else []) + PPA_STATUS_HEADERS
-    )
-    col_widths = (
-        COL_WIDTHS + (ENERCAST_COL_WIDTHS if has_enercast else [])
-        + (STEP1_COL_WIDTHS if has_step1 else []) + PPA_STATUS_COL_WIDTHS
-    )
+    # Every comparison "stage" beyond the official schedule (Step 1 and/or
+    # Step 2, whichever are present as their own MW columns -- see
+    # utils.parse_energy_file / calculator.evaluate_step1/evaluate_step2)
+    # gets its own contiguous 4-column block, in stage order, right after
+    # Enercast (if present). Built generically so 1 or 2 active stages share
+    # one code path below instead of a copy-pasted block per stage.
+    active_stages = [n_ for n_ in (1, 2) if f"Step{n_}_MW" in block_df.columns]
+    headers = HEADERS + (ENERCAST_HEADERS if has_enercast else [])
+    col_widths = COL_WIDTHS + (ENERCAST_COL_WIDTHS if has_enercast else [])
+    stage_col0 = {}
+    stage_cols = {}  # n -> {"mw":, "dev":, "pct":, "pen":} column letters
+    next_col_0 = len(HEADERS) + (len(ENERCAST_HEADERS) if has_enercast else 0)
+    for n_ in active_stages:
+        stage_col0[n_] = next_col_0
+        stage_cols[n_] = {
+            "mw": xl_col_to_name(next_col_0), "dev": xl_col_to_name(next_col_0 + 1),
+            "pct": xl_col_to_name(next_col_0 + 2), "pen": xl_col_to_name(next_col_0 + 3),
+        }
+        headers += _stage_headers(n_)
+        col_widths += STAGE_COL_WIDTHS
+        next_col_0 += 4
+    headers += PPA_STATUS_HEADERS
+    col_widths += PPA_STATUS_COL_WIDTHS
     last_col = len(headers) - 1
-    # Enercast (if present) always occupies columns I-L (8-11) right after
-    # the base columns, exactly as before. Step 1 (if present) is appended
-    # right after Enercast. PPA Amount / Status are always appended LAST so
-    # every existing hardcoded column-letter reference below (C/D/E/F/G,
-    # I/J/K/L for Enercast) keeps pointing at exactly what it always has.
-    enercast_col_0 = len(HEADERS) if has_enercast else None
-    step1_col_0 = (len(HEADERS) + (len(ENERCAST_HEADERS) if has_enercast else 0)) if has_step1 else None
-    ppa_col_0 = (
-        len(HEADERS) + (len(ENERCAST_HEADERS) if has_enercast else 0)
-        + (len(STEP1_HEADERS) if has_step1 else 0)
-    )
+    # PPA Amount / Status are always appended LAST (after Enercast and any
+    # stage columns) so every existing hardcoded column-letter reference
+    # below (C/D/E/F/G, I/J/K/L for Enercast) keeps pointing at exactly what
+    # it always has.
+    ppa_col_0 = next_col_0
     status_col_0 = ppa_col_0 + 1
     ppa_col = xl_col_to_name(ppa_col_0)
     status_col = xl_col_to_name(status_col_0)
-    if has_step1:
-        st_mw_col = xl_col_to_name(step1_col_0)
-        st_dev_col = xl_col_to_name(step1_col_0 + 1)
-        st_pct_col = xl_col_to_name(step1_col_0 + 2)
-        st_pen_col = xl_col_to_name(step1_col_0 + 3)
     header_row_0 = 3          # 0-indexed row for the column header row (Excel row 4)
     data_start_0 = 4          # 0-indexed first data row (Excel row 5)
     data_end_0 = data_start_0 + n - 1
@@ -224,8 +231,14 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
         note_text += PENDING_NOTE
     if has_enercast:
         note_text += ENERCAST_NOTE
-    if has_step1:
-        note_text += STEP1_NOTE
+    if active_stages:
+        official_n = max(active_stages) + 1  # the stage right after the last comparison stage is official
+        stage_list = " and ".join(STAGE_STEP_NAMES[n_] for n_ in active_stages)
+        note_text += (
+            f" {stage_list} {'is' if len(active_stages) == 1 else 'are'} shown alongside for "
+            f"comparison — the official AI Schedule is Step {official_n}; earlier stage(s) are "
+            f"penalised separately, purely for reference, against the same actual meter data."
+        )
     ws.merge_range(1, 0, 1, last_col, note_text, note_fmt)
 
     # -------------------------------------------------------------- Header
@@ -291,16 +304,17 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
             else:
                 ws.write_blank(r0, 8, None, mw_fmt)
 
-        # Step 1 (MW) -- a plain literal value (or a genuine blank cell if
-        # this block has no Step 1 forecast). The Deviation/Deviation %/
-        # Penalty columns that follow it are filled in the formula pass
-        # below, exactly like Enercast's J/K/L above.
-        if has_step1:
-            s1_mw = row.get("Step1_MW")
-            if pd.notna(s1_mw):
-                ws.write_number(r0, step1_col_0, float(s1_mw), mw_fmt)
+        # Each active comparison stage's MW column -- a plain literal value
+        # (or a genuine blank cell if this block has no forecast for that
+        # stage). The Deviation/Deviation %/Penalty columns that follow are
+        # filled in the formula pass below, exactly like Enercast's J/K/L.
+        for n_ in active_stages:
+            stage_mw = row.get(f"Step{n_}_MW")
+            col0 = stage_col0[n_]
+            if pd.notna(stage_mw):
+                ws.write_number(r0, col0, float(stage_mw), mw_fmt)
             else:
-                ws.write_blank(r0, step1_col_0, None, mw_fmt)
+                ws.write_blank(r0, col0, None, mw_fmt)
 
     # --------------------------------------------------------- Day summary
     blank1_0 = data_end_0 + 1
@@ -424,72 +438,78 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
     else:
         last_summary_row_0 = total_row_0
 
-    # ----------------------------------------------- Step 1 summary (optional)
-    # A third, parallel Day-Summary block for Step 1 (base forecast, before
-    # weather adjustment) -- reference only, never feeds into the official
-    # (Step 2) schedule's own penalty above. Only built when the AI Schedule
-    # file used the 2-step format.
-    s1_summary_rows_0 = {}
-    s1_mad_pct_row_0 = None
-    if has_step1:
-        # Step 1 is graded against the actual meter reading too -- a block
-        # with a Step 1 forecast but a missing/Pending Actual has nothing to
-        # compare against, exactly like the Enercast block above.
-        s1_mask = block_df["Step1_MW"].notna() & block_df["Actual_MW"].notna()
-        s1_n = int(s1_mask.sum())
-        s1_dev = block_df.loc[s1_mask, "Step1_Deviation_MW"].to_numpy() if s1_n else np.array([])
-        s1_pen = block_df.loc[s1_mask, "Step1_Penalty"].to_numpy() if s1_n else np.array([])
-        s1_total_mw = float(block_df.loc[s1_mask, "Step1_MW"].sum()) if s1_n else 0.0
-        s1_total_actual_mw = float(block_df.loc[s1_mask, "Actual_MW"].sum()) if s1_n else 0.0
+    # ------------------------------------------- Stage summaries (optional)
+    # A parallel Day-Summary block for each active comparison stage (Step 1
+    # and/or Step 2, whichever aren't the official schedule) -- reference
+    # only, never feeds into the official schedule's own penalty above.
+    # Built generically so 1 or 2 active stages share one code path.
+    stage_mad_pct_row_0 = {}
+    for n_ in active_stages:
+        mw_c, dev_c, pct_c, pen_c = (stage_cols[n_]["mw"], stage_cols[n_]["dev"],
+                                       stage_cols[n_]["pct"], stage_cols[n_]["pen"])
+        mw_col_name = f"Step{n_}_MW"
+        dev_col_name = f"Step{n_}_Deviation_MW"
+        pen_col_name = f"Step{n_}_Penalty"
 
-        s1_header_0 = last_summary_row_0 + 2
-        ws.write(s1_header_0, 0, "STEP 1 SUMMARY — BASE FORECAST DSM PENALTY (reference only)", section_fmt)
+        # Graded against the actual meter reading too -- a block with a
+        # forecast for this stage but a missing/Pending Actual has nothing
+        # to compare against, exactly like the Enercast block above.
+        st_mask = block_df[mw_col_name].notna() & block_df["Actual_MW"].notna()
+        st_n = int(st_mask.sum())
+        st_dev = block_df.loc[st_mask, dev_col_name].to_numpy() if st_n else np.array([])
+        st_pen = block_df.loc[st_mask, pen_col_name].to_numpy() if st_n else np.array([])
+        st_total_mw = float(block_df.loc[st_mask, mw_col_name].sum()) if st_n else 0.0
+        st_total_actual_mw = float(block_df.loc[st_mask, "Actual_MW"].sum()) if st_n else 0.0
 
-        s1_defs = [
-            ("Blocks with Step 1 + a real meter reading",
-             f"=COUNT({st_mw_col}{s}:{st_mw_col}{e})", fmt_int, float(s1_n)),
-            ("Total Step 1 (MW, scored blocks)",
-             f"=SUM({st_mw_col}{s}:{st_mw_col}{e})", fmt_3dp, s1_total_mw),
+        st_header_0 = last_summary_row_0 + 2
+        ws.write(st_header_0, 0, f"STEP {n_} SUMMARY — DSM PENALTY (reference only)", section_fmt)
+
+        st_defs = [
+            (f"Blocks with Step {n_} + a real meter reading",
+             f"=COUNT({mw_c}{s}:{mw_c}{e})", fmt_int, float(st_n)),
+            (f"Total Step {n_} (MW, scored blocks)",
+             f"=SUM({mw_c}{s}:{mw_c}{e})", fmt_3dp, st_total_mw),
             ("Total actual (MW, scored blocks)",
-             f'=SUMIF({st_mw_col}{s}:{st_mw_col}{e},"<>",D{s}:D{e})', fmt_3dp, s1_total_actual_mw),
-            ("Total deviation — actual minus Step 1 (MW)",
-             f"=SUM({st_dev_col}{s}:{st_dev_col}{e})", fmt_signed_3dp,
-             float(s1_dev.sum()) if s1_n else 0.0),
+             f'=SUMIF({mw_c}{s}:{mw_c}{e},"<>",D{s}:D{e})', fmt_3dp, st_total_actual_mw),
+            (f"Total deviation — actual minus Step {n_} (MW)",
+             f"=SUM({dev_c}{s}:{dev_c}{e})", fmt_signed_3dp,
+             float(st_dev.sum()) if st_n else 0.0),
             ("Mean absolute deviation (MW)",
-             f"=SUMPRODUCT(ABS({st_dev_col}{s}:{st_dev_col}{e}))/COUNT({st_dev_col}{s}:{st_dev_col}{e})", fmt_3dp,
-             float(np.abs(s1_dev).mean()) if s1_n else 0.0),
+             f"=SUMPRODUCT(ABS({dev_c}{s}:{dev_c}{e}))/COUNT({dev_c}{s}:{dev_c}{e})", fmt_3dp,
+             float(np.abs(st_dev).mean()) if st_n else 0.0),
             ("Max absolute deviation (MW)",
-             f"=MAX(MAX({st_dev_col}{s}:{st_dev_col}{e}),-MIN({st_dev_col}{s}:{st_dev_col}{e}))", fmt_3dp,
-             float(np.abs(s1_dev).max()) if s1_n else 0.0),
+             f"=MAX(MAX({dev_c}{s}:{dev_c}{e}),-MIN({dev_c}{s}:{dev_c}{e}))", fmt_3dp,
+             float(np.abs(st_dev).max()) if st_n else 0.0),
             ("Blocks over 0.5 MW deviation (RED)",
-             f'=SUMPRODUCT((ABS({st_dev_col}{s}:{st_dev_col}{e})>0.5)*({st_mw_col}{s}:{st_mw_col}{e}<>""))', fmt_int,
-             float((np.abs(s1_dev) > 0.5).sum()) if s1_n else 0.0),
+             f'=SUMPRODUCT((ABS({dev_c}{s}:{dev_c}{e})>0.5)*({mw_c}{s}:{mw_c}{e}<>""))', fmt_int,
+             float((np.abs(st_dev) > 0.5).sum()) if st_n else 0.0),
             ("Blocks within 0.5 MW deviation (BLUE)",
-             f'=SUMPRODUCT((ABS({st_dev_col}{s}:{st_dev_col}{e})<=0.5)*({st_mw_col}{s}:{st_mw_col}{e}<>""))', fmt_int,
-             float((np.abs(s1_dev) <= 0.5).sum()) if s1_n else 0.0),
+             f'=SUMPRODUCT((ABS({dev_c}{s}:{dev_c}{e})<=0.5)*({mw_c}{s}:{mw_c}{e}<>""))', fmt_int,
+             float((np.abs(st_dev) <= 0.5).sum()) if st_n else 0.0),
             ("Mean absolute deviation (% of capacity)", None, fmt_2dp,
-             float(np.abs(s1_dev).mean() / cap * 100) if s1_n else 0.0),  # formula added after cap_row known
+             float(np.abs(st_dev).mean() / cap * 100) if st_n else 0.0),  # formula added after cap_row known
             ("Blocks that incurred a penalty",
-             f'=COUNTIF({st_pen_col}{s}:{st_pen_col}{e},">0")', fmt_int,
-             float((s1_pen > 0).sum()) if s1_n else 0.0),
+             f'=COUNTIF({pen_c}{s}:{pen_c}{e},">0")', fmt_int,
+             float((st_pen > 0).sum()) if st_n else 0.0),
             ("Worst single-block penalty (Rs)",
-             f"=MAX({st_pen_col}{s}:{st_pen_col}{e})", fmt_2dp, float(s1_pen.max()) if s1_n else 0.0),
-            ("TOTAL STEP 1 DSM PENALTY FOR THE DAY (Rs)",
-             f"=SUM({st_pen_col}{s}:{st_pen_col}{e})", fmt_2dp, float(s1_pen.sum()) if s1_n else 0.0),
+             f"=MAX({pen_c}{s}:{pen_c}{e})", fmt_2dp, float(st_pen.max()) if st_n else 0.0),
+            (f"TOTAL STEP {n_} DSM PENALTY FOR THE DAY (Rs)",
+             f"=SUM({pen_c}{s}:{pen_c}{e})", fmt_2dp, float(st_pen.sum()) if st_n else 0.0),
         ]
-        for i, (label, formula, numfmt, cached) in enumerate(s1_defs):
-            r0 = s1_header_0 + 1 + i
+        st_summary_rows_0 = {}
+        for i, (label, formula, numfmt, cached) in enumerate(st_defs):
+            r0 = st_header_0 + 1 + i
             ws.write(r0, 0, label, label_fmt)
-            s1_summary_rows_0[label] = r0
+            st_summary_rows_0[label] = r0
             if formula is not None:
                 ws.write_formula(r0, 2, formula, numfmt, cached)
 
-        s1_mad_pct_row_0 = s1_summary_rows_0["Mean absolute deviation (% of capacity)"]
-        s1_total_row_0 = s1_summary_rows_0["TOTAL STEP 1 DSM PENALTY FOR THE DAY (Rs)"]
-        ws.write(s1_total_row_0, 0, "TOTAL STEP 1 DSM PENALTY FOR THE DAY (Rs)", total_label_fmt)
-        ws.write_formula(s1_total_row_0, 2, f"=SUM({st_pen_col}{s}:{st_pen_col}{e})", total_value_fmt,
-                          float(s1_pen.sum()) if s1_n else 0.0)
-        last_summary_row_0 = s1_total_row_0
+        stage_mad_pct_row_0[n_] = st_summary_rows_0["Mean absolute deviation (% of capacity)"]
+        st_total_row_0 = st_summary_rows_0[f"TOTAL STEP {n_} DSM PENALTY FOR THE DAY (Rs)"]
+        ws.write(st_total_row_0, 0, f"TOTAL STEP {n_} DSM PENALTY FOR THE DAY (Rs)", total_label_fmt)
+        ws.write_formula(st_total_row_0, 2, f"=SUM({pen_c}{s}:{pen_c}{e})", total_value_fmt,
+                          float(st_pen.sum()) if st_n else 0.0)
+        last_summary_row_0 = st_total_row_0
 
     # ------------------------------------------------------ Slab parameters
     blank2_0 = last_summary_row_0 + 1
@@ -581,32 +601,34 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
                 for col in (9, 10, 11):
                     ws.write_blank(r0, col, None, mw_fmt if col == 9 else (pct_fmt if col == 10 else pen_fmt))
 
-        if has_step1:
-            # Step 1 comparison needs BOTH a Step 1 forecast AND a real
+        for n_ in active_stages:
+            mw_c, dev_c = stage_cols[n_]["mw"], stage_cols[n_]["dev"]
+            col0 = stage_col0[n_]
+            # This stage's comparison needs BOTH a forecast AND a real
             # actual meter reading for this block -- if Actual is missing
-            # (block Pending), there's nothing to compare Step 1 against.
-            if pd.notna(row_i.get("Step1_MW")) and pd.notna(row_i.get("Actual_MW")):
-                ws.write_formula(r0, step1_col_0 + 1, f"=D{r}-{st_mw_col}{r}", mw_fmt,
-                                  float(row_i["Step1_Deviation_MW"]))
-                ws.write_formula(r0, step1_col_0 + 2, f"={st_dev_col}{r}/$C${cap_row}*100", pct_fmt,
-                                  float(row_i["Step1_Deviation_%"]))
-                terms_s1 = []
+            # (block Pending), there's nothing to compare against.
+            if pd.notna(row_i.get(f"Step{n_}_MW")) and pd.notna(row_i.get("Actual_MW")):
+                ws.write_formula(r0, col0 + 1, f"=D{r}-{mw_c}{r}", mw_fmt,
+                                  float(row_i[f"Step{n_}_Deviation_MW"]))
+                ws.write_formula(r0, col0 + 2, f"={dev_c}{r}/$C${cap_row}*100", pct_fmt,
+                                  float(row_i[f"Step{n_}_Deviation_%"]))
+                terms_st = []
                 prev_bound = "0"
                 for slab, srow in zip(plant.dsm_slabs, slab_rows):
                     rate_ref = f"$D${srow}"
                     if slab.upper is not None:
                         bound_ref = f"$E${srow}"
-                        terms_s1.append(f"MAX(0,MIN(ABS({st_dev_col}{r}),{bound_ref})-{prev_bound})*{rate_ref}")
+                        terms_st.append(f"MAX(0,MIN(ABS({dev_c}{r}),{bound_ref})-{prev_bound})*{rate_ref}")
                         prev_bound = bound_ref
                     else:
-                        terms_s1.append(f"MAX(0,ABS({st_dev_col}{r})-{prev_bound})*{rate_ref}")
-                s1_formula = f"=$C${energy_factor_row}*(" + "+".join(terms_s1) + ")"
-                ws.write_formula(r0, step1_col_0 + 3, s1_formula, pen_fmt, float(row_i["Step1_Penalty"]))
+                        terms_st.append(f"MAX(0,ABS({dev_c}{r})-{prev_bound})*{rate_ref}")
+                st_formula = f"=$C${energy_factor_row}*(" + "+".join(terms_st) + ")"
+                ws.write_formula(r0, col0 + 3, st_formula, pen_fmt, float(row_i[f"Step{n_}_Penalty"]))
             else:
-                for col in (step1_col_0 + 1, step1_col_0 + 2, step1_col_0 + 3):
+                for col in (col0 + 1, col0 + 2, col0 + 3):
                     ws.write_blank(
                         r0, col, None,
-                        mw_fmt if col == step1_col_0 + 1 else (pct_fmt if col == step1_col_0 + 2 else pen_fmt),
+                        mw_fmt if col == col0 + 1 else (pct_fmt if col == col0 + 2 else pen_fmt),
                     )
 
     mad_pct_row_0 = summary_rows_0["Mean absolute deviation (% of capacity)"]
@@ -628,15 +650,19 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
             fmt_2dp, e_mad_pct_cached,
         )
 
-    if has_step1 and s1_mad_pct_row_0 is not None:
-        s1_mask = block_df["Step1_MW"].notna() & block_df["Actual_MW"].notna()
-        s1_n = int(s1_mask.sum())
-        s1_dev_for_pct = block_df.loc[s1_mask, "Step1_Deviation_MW"].to_numpy() if s1_n else np.array([])
-        s1_mad_pct_cached = float(np.abs(s1_dev_for_pct).mean() / cap * 100) if s1_n else 0.0
+    for n_ in active_stages:
+        st_row_0 = stage_mad_pct_row_0.get(n_)
+        if st_row_0 is None:
+            continue
+        dev_c = stage_cols[n_]["dev"]
+        st_mask = block_df[f"Step{n_}_MW"].notna() & block_df["Actual_MW"].notna()
+        st_n = int(st_mask.sum())
+        st_dev_for_pct = block_df.loc[st_mask, f"Step{n_}_Deviation_MW"].to_numpy() if st_n else np.array([])
+        st_mad_pct_cached = float(np.abs(st_dev_for_pct).mean() / cap * 100) if st_n else 0.0
         ws.write_formula(
-            s1_mad_pct_row_0, 2,
-            f"=SUMPRODUCT(ABS({st_dev_col}{s}:{st_dev_col}{e}))/COUNT({st_dev_col}{s}:{st_dev_col}{e})/$C${cap_row}*100",
-            fmt_2dp, s1_mad_pct_cached,
+            st_row_0, 2,
+            f"=SUMPRODUCT(ABS({dev_c}{s}:{dev_c}{e}))/COUNT({dev_c}{s}:{dev_c}{e})/$C${cap_row}*100",
+            fmt_2dp, st_mad_pct_cached,
         )
 
     # --------------------------------------------------------- Conditional
@@ -672,20 +698,22 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
                 "criteria": f"AND(ISNUMBER($L{s}),$L{s}>0)",
                 "format": red_font,
             })
-        if has_step1:
-            ws.conditional_format(s - 1, step1_col_0 + 1, e - 1, step1_col_0 + 2, {
+        for n_ in active_stages:
+            col0 = stage_col0[n_]
+            dev_c, pen_c = stage_cols[n_]["dev"], stage_cols[n_]["pen"]
+            ws.conditional_format(s - 1, col0 + 1, e - 1, col0 + 2, {
                 "type": "formula",
-                "criteria": f"AND(ISNUMBER(${st_dev_col}{s}),ABS(${st_dev_col}{s})>0.5)",
+                "criteria": f"AND(ISNUMBER(${dev_c}{s}),ABS(${dev_c}{s})>0.5)",
                 "format": red_font,
             })
-            ws.conditional_format(s - 1, step1_col_0 + 1, e - 1, step1_col_0 + 2, {
+            ws.conditional_format(s - 1, col0 + 1, e - 1, col0 + 2, {
                 "type": "formula",
-                "criteria": f"AND(ISNUMBER(${st_dev_col}{s}),ABS(${st_dev_col}{s})<=0.5)",
+                "criteria": f"AND(ISNUMBER(${dev_c}{s}),ABS(${dev_c}{s})<=0.5)",
                 "format": blue_font,
             })
-            ws.conditional_format(s - 1, step1_col_0 + 3, e - 1, step1_col_0 + 3, {
+            ws.conditional_format(s - 1, col0 + 3, e - 1, col0 + 3, {
                 "type": "formula",
-                "criteria": f"AND(ISNUMBER(${st_pen_col}{s}),${st_pen_col}{s}>0)",
+                "criteria": f"AND(ISNUMBER(${pen_c}{s}),${pen_c}{s}>0)",
                 "format": red_font,
             })
 
@@ -700,24 +728,28 @@ def build_excel_report(block_df: pd.DataFrame, summary: dict, plant: PlantConfig
         pen_values = block_df["Total_Block_Penalty"].to_numpy()
         dev_pct_values = block_df["Deviation_%"].to_numpy()
         e_pen_values = block_df["Enercast_Penalty"].to_numpy() if has_enercast else None
-        s1_pen_values = block_df["Step1_Penalty"].to_numpy() if has_step1 else None
+        stage_pen_values = {n_: block_df[f"Step{n_}_Penalty"].to_numpy() for n_ in active_stages}
+        stage_pen_col = {n_: stage_cols[n_]["pen"] for n_ in active_stages}
         helper = _write_chart_helper_data(ws_graphs, SHEET, data_start_0, data_end_0, s, e,
                                            dev_values, pen_values, dev_pct_values,
-                                           has_enercast, e_pen_values, has_step1, s1_pen_values,
-                                           step1_pen_col=(st_pen_col if has_step1 else None))
+                                           has_enercast, e_pen_values,
+                                           active_stages=active_stages,
+                                           stage_pen_values=stage_pen_values,
+                                           stage_pen_col=stage_pen_col)
         ws_graphs.merge_range(0, 0, 0, 7, f"{plant.name} — DSM Evaluation Charts", title_fmt)
-        # Enercast (4 cols) and/or Step 1 (4 cols) and PPA Amount + Status
-        # (2 cols) sit to the right of the base columns on the main sheet --
-        # shift the chart anchors so they never sit on top of that data.
-        chart_offset = (4 if has_enercast else 0) + (4 if has_step1 else 0) + 2
+        # Enercast (4 cols) and/or each active stage (4 cols each) and PPA
+        # Amount + Status (2 cols) sit to the right of the base columns on
+        # the main sheet -- shift the chart anchors so they never sit on top
+        # of that data.
+        chart_offset = (4 if has_enercast else 0) + 4 * len(active_stages) + 2
         _add_all_charts(wb, ws, SHEET, report_date, data_start_0, data_end_0, helper, dev_values,
                          anchor_col_left=9 + chart_offset, anchor_col_right=23 + chart_offset,
                          row_step=18, size=(430, 260), has_enercast=has_enercast,
-                         has_step1=has_step1, step1_col_0=step1_col_0)
+                         active_stages=active_stages, stage_col0=stage_col0)
         _add_all_charts(wb, ws_graphs, SHEET, report_date, data_start_0, data_end_0, helper, dev_values,
                          anchor_col_left=0, anchor_col_right=11, row_step=22, size=(560, 340),
                          start_row=2, has_enercast=has_enercast,
-                         has_step1=has_step1, step1_col_0=step1_col_0)
+                         active_stages=active_stages, stage_col0=stage_col0)
 
     wb.close()
     return output.getvalue()
@@ -741,18 +773,20 @@ CHART_TITLES = {
 _H_CUM = 28          # AC: cumulative penalty, one row per data row (aligned with main sheet rows)
 _H_PIE_LABEL = 30    # AE: 3 rows -- Over / Under / No Deviation
 _H_PIE_COUNT = 31    # AF
-_H_BIN_EDGE = 33     # AH: 11 histogram bin edges
-_H_BIN_LABEL = 34    # AI: 10 histogram bin labels
-_H_BIN_COUNT = 35    # AJ: 10 histogram bin counts
 _H_ECUM = 29         # AD: Enercast cumulative penalty (comparison-only, when present)
 _H_S1CUM = 32        # AG: Step 1 cumulative penalty (comparison-only, when present)
+_H_S2CUM = 33        # AH: Step 2 cumulative penalty (comparison-only, when present)
+_H_STAGE_CUM = {1: _H_S1CUM, 2: _H_S2CUM}
+_H_BIN_EDGE = 34     # AI: 11 histogram bin edges
+_H_BIN_LABEL = 35    # AJ: 10 histogram bin labels
+_H_BIN_COUNT = 36    # AK: 10 histogram bin counts
 
 
 def _write_chart_helper_data(ws_graphs, main_sheet: str, data_start_0: int, data_end_0: int, s: int, e: int,
                               dev_values, pen_values, dev_pct_values,
                               has_enercast: bool = False, e_pen_values=None,
-                              has_step1: bool = False, s1_pen_values=None,
-                              step1_pen_col: str = None) -> dict:
+                              active_stages=None, stage_pen_values: dict = None,
+                              stage_pen_col: dict = None) -> dict:
     """Write hidden formula-driven helper data on the Graphs sheet that the
     native charts reference for series the main sheet's own columns can't
     drive directly: a running cumulative-penalty total, over/under/no-
@@ -791,18 +825,28 @@ def _write_chart_helper_data(ws_graphs, main_sheet: str, data_start_0: int, data
             r = r0 + 1
             ws_graphs.write_formula(r0, _H_ECUM, f"=SUM('{main_sheet}'!$L${s}:$L${r})", None, float(e_cum[offset]))
 
-    # Step 1 running cumulative penalty (comparison only), same pattern as
-    # Enercast above but summing the Step 1 Penalty column.
-    if has_step1 and s1_pen_values is not None and step1_pen_col:
-        s1_cum = np.nancumsum(np.nan_to_num(s1_pen_values, nan=0.0)) if len(s1_pen_values) else np.array([])
+    # Per-stage running cumulative penalty (comparison only), same pattern as
+    # Enercast above but summing each active stage's own Penalty column.
+    active_stages = active_stages or []
+    stage_pen_values = stage_pen_values or {}
+    stage_pen_col = stage_pen_col or {}
+    stage_cum_ranges = {}
+    for n_ in active_stages:
+        h_col = _H_STAGE_CUM.get(n_)
+        pen_col = stage_pen_col.get(n_)
+        pen_vals = stage_pen_values.get(n_)
+        if h_col is None or pen_col is None or pen_vals is None:
+            continue
+        st_cum = np.nancumsum(np.nan_to_num(pen_vals, nan=0.0)) if len(pen_vals) else np.array([])
         for offset in range(data_end_0 - data_start_0 + 1):
             r0 = data_start_0 + offset
             r = r0 + 1
             ws_graphs.write_formula(
-                r0, _H_S1CUM,
-                f"=SUM('{main_sheet}'!${step1_pen_col}${s}:${step1_pen_col}${r})",
-                None, float(s1_cum[offset]),
+                r0, h_col,
+                f"=SUM('{main_sheet}'!${pen_col}${s}:${pen_col}${r})",
+                None, float(st_cum[offset]),
             )
+        stage_cum_ranges[n_] = [None, data_start_0, h_col, data_end_0, h_col]
 
     # Over / Under / No Deviation counts, for the pie chart.
     pie_defs = [
@@ -850,10 +894,12 @@ def _write_chart_helper_data(ws_graphs, main_sheet: str, data_start_0: int, data
     ws_graphs.set_column(_H_CUM, _H_BIN_COUNT, None, None, {"hidden": True})
 
     GRAPHS = "Graphs"
+    for n_ in stage_cum_ranges:
+        stage_cum_ranges[n_][0] = GRAPHS
     return {
         "cum_values": [GRAPHS, data_start_0, _H_CUM, data_end_0, _H_CUM],
         "ecum_values": [GRAPHS, data_start_0, _H_ECUM, data_end_0, _H_ECUM] if has_enercast else None,
-        "s1cum_values": [GRAPHS, data_start_0, _H_S1CUM, data_end_0, _H_S1CUM] if has_step1 else None,
+        "stage_cum_values": stage_cum_ranges,
         "pie_categories": [GRAPHS, 0, _H_PIE_LABEL, 2, _H_PIE_LABEL],
         "pie_values": [GRAPHS, 0, _H_PIE_COUNT, 2, _H_PIE_COUNT],
         "hist_categories": [GRAPHS, 0, _H_BIN_LABEL, n_bins - 1, _H_BIN_LABEL],
@@ -864,7 +910,7 @@ def _write_chart_helper_data(ws_graphs, main_sheet: str, data_start_0: int, data
 def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, data_end_0: int,
                      helper: dict, dev_values, anchor_col_left: int, anchor_col_right: int, row_step: int,
                      size: tuple, start_row: int = 2, has_enercast: bool = False,
-                     has_step1: bool = False, step1_col_0: int = None):
+                     active_stages=None, stage_col0: dict = None):
     """Build all 6 native, interactive Excel chart objects and place them on
     `ws` in a two-column grid (left: Actual vs Predicted, Penalty, Over/Under
     pie; right: Deviation, Cumulative penalty, Histogram) -- mirroring the
@@ -873,6 +919,9 @@ def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, dat
     no image rendering / kaleido is involved at all."""
     cat_range = [sheet, data_start_0, 1, data_end_0, 1]  # column B (Time block)
     width, height = size
+    active_stages = active_stages or []
+    stage_col0 = stage_col0 or {}
+    has_stages = bool(active_stages)
 
     def _placed(chart, col, row):
         chart.set_size({"width": width, "height": height})
@@ -896,11 +945,16 @@ def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, dat
             "values": [sheet, data_start_0, 8, data_end_0, 8],
             "line": {"color": COLOR_ENERCAST, "width": 2, "dash_type": "round_dot"},
         })
-    if has_step1:
+    _dash_types = {1: "dash", 2: "dash_dot"}
+    for n_ in active_stages:
+        col0 = stage_col0.get(n_)
+        if col0 is None:
+            continue
         c1.add_series({
-            "name": [sheet, 3, step1_col_0], "categories": cat_range,
-            "values": [sheet, data_start_0, step1_col_0, data_end_0, step1_col_0],
-            "line": {"color": COLOR_STEP1, "width": 2, "dash_type": "dash"},
+            "name": [sheet, 3, col0], "categories": cat_range,
+            "values": [sheet, data_start_0, col0, data_end_0, col0],
+            "line": {"color": STEP_COLOR.get(n_, COLOR_STEP1), "width": 2,
+                     "dash_type": _dash_types.get(n_, "dash")},
         })
     c1.set_title({"name": f"Actual vs Predicted Generation - {report_date}"})
     c1.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
@@ -921,16 +975,19 @@ def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, dat
             "values": [sheet, data_start_0, 9, data_end_0, 9],
             "fill": {"color": COLOR_ENERCAST},
         })
-    if has_step1:
+    for n_ in active_stages:
+        col0 = stage_col0.get(n_)
+        if col0 is None:
+            continue
         c2.add_series({
-            "name": [sheet, 3, step1_col_0 + 1], "categories": cat_range,
-            "values": [sheet, data_start_0, step1_col_0 + 1, data_end_0, step1_col_0 + 1],
-            "fill": {"color": COLOR_STEP1},
+            "name": [sheet, 3, col0 + 1], "categories": cat_range,
+            "values": [sheet, data_start_0, col0 + 1, data_end_0, col0 + 1],
+            "fill": {"color": STEP_COLOR.get(n_, COLOR_STEP1)},
         })
     c2.set_title({"name": f"Deviation (MW) by Block - {report_date}"})
     c2.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
     c2.set_y_axis({"name": "Deviation MW"})
-    c2.set_legend({"none": not (has_enercast or has_step1)})
+    c2.set_legend({"none": not (has_enercast or has_stages)})
 
     # 3) DSM Penalty (Rs) by Block -- column chart
     c3 = wb.add_chart({"type": "column"})
@@ -945,16 +1002,19 @@ def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, dat
             "values": [sheet, data_start_0, 11, data_end_0, 11],
             "fill": {"color": COLOR_ENERCAST},
         })
-    if has_step1:
+    for n_ in active_stages:
+        col0 = stage_col0.get(n_)
+        if col0 is None:
+            continue
         c3.add_series({
-            "name": [sheet, 3, step1_col_0 + 3], "categories": cat_range,
-            "values": [sheet, data_start_0, step1_col_0 + 3, data_end_0, step1_col_0 + 3],
-            "fill": {"color": COLOR_STEP1},
+            "name": [sheet, 3, col0 + 3], "categories": cat_range,
+            "values": [sheet, data_start_0, col0 + 3, data_end_0, col0 + 3],
+            "fill": {"color": STEP_COLOR.get(n_, COLOR_STEP1)},
         })
     c3.set_title({"name": f"DSM Penalty (Rs) by Block - {report_date}"})
     c3.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
     c3.set_y_axis({"name": "Penalty (Rs)"})
-    c3.set_legend({"none": not (has_enercast or has_step1)})
+    c3.set_legend({"none": not (has_enercast or has_stages)})
 
     # 4) Cumulative DSM Penalty -- area chart
     c4 = wb.add_chart({"type": "area"})
@@ -971,17 +1031,22 @@ def _add_all_charts(wb, ws, sheet: str, report_date: str, data_start_0: int, dat
             "fill": {"color": COLOR_ENERCAST, "transparency": 40},
             "line": {"color": COLOR_ENERCAST, "width": 2, "dash_type": "round_dot"},
         })
-    if has_step1 and helper.get("s1cum_values"):
+    _stage_cum_values = helper.get("stage_cum_values") or {}
+    for n_ in active_stages:
+        cum_range = _stage_cum_values.get(n_)
+        if not cum_range:
+            continue
+        color = STEP_COLOR.get(n_, COLOR_STEP1)
         c4.add_series({
-            "name": "Step 1 Cumulative Penalty", "categories": cat_range,
-            "values": helper["s1cum_values"],
-            "fill": {"color": COLOR_STEP1, "transparency": 40},
-            "line": {"color": COLOR_STEP1, "width": 2, "dash_type": "dash"},
+            "name": f"Step {n_} Cumulative Penalty", "categories": cat_range,
+            "values": cum_range,
+            "fill": {"color": color, "transparency": 40},
+            "line": {"color": color, "width": 2, "dash_type": _dash_types.get(n_, "dash")},
         })
     c4.set_title({"name": f"Cumulative DSM Penalty Through the Day - {report_date}"})
     c4.set_x_axis({"name": "Time block", "num_font": {"rotation": -45, "size": 7}})
     c4.set_y_axis({"name": "Cumulative Penalty (Rs)"})
-    c4.set_legend({"none": not (has_enercast or has_step1)})
+    c4.set_legend({"none": not (has_enercast or has_stages)})
 
     # 5) Over vs Under Generation -- pie chart
     c5 = wb.add_chart({"type": "pie"})

@@ -134,12 +134,15 @@ def evaluate_schedule(merged_df: pd.DataFrame, plant: PlantConfig) -> pd.DataFra
     )
     if "Generated_At" in df.columns:
         ordered_cols.append("Generated_At")
-    # Step1_MW (present only when the AI Schedule file used the 2-step
-    # format) is carried through here too, so calculator.evaluate_step1()
-    # and everything downstream (charts, Excel export) can still see it --
-    # it's otherwise not touched by this function at all.
-    if "Step1_MW" in df.columns:
-        ordered_cols.append("Step1_MW")
+    # Step1_MW / Step2_MW (present only when the AI Schedule file used the
+    # multi-step format and that stage isn't the official one) are carried
+    # through here too, so calculator.evaluate_step1()/evaluate_step2() and
+    # everything downstream (charts, Excel export) can still see them --
+    # they're otherwise not touched by this function at all.
+    for n in (1, 2):
+        col = f"Step{n}_MW"
+        if col in df.columns:
+            ordered_cols.append(col)
     df = df[ordered_cols]
     return df
 
@@ -210,24 +213,24 @@ def enercast_summary(df: pd.DataFrame) -> Optional[dict]:
     }
 
 
-def evaluate_step1(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
-    """Add Step 1 (raw meter-base forecast, before weather adjustment)
-    comparison columns (Step1_Deviation_MW, Step1_Deviation_%,
-    Step1_Penalty) using the SAME piecewise DSM slab logic as
-    evaluate_schedule(), but graded against Step1_MW instead of the
-    official Scheduled_MW (which is Step 2, the weather-adjusted forecast).
+def _evaluate_comparison_stage(df: pd.DataFrame, plant: PlantConfig, mw_col: str, prefix: str) -> pd.DataFrame:
+    """Shared implementation behind evaluate_step1() / evaluate_step2():
+    add `{prefix}_Deviation_MW`, `{prefix}_Deviation_%` and `{prefix}_Penalty`
+    columns, using the SAME piecewise DSM slab logic as evaluate_schedule(),
+    but graded against `mw_col` instead of the official Scheduled_MW.
 
-    This lets the two stages of the AI's own forecasting pipeline be
-    penalised independently, so the value the weather-adjustment step adds
-    (or costs) can be seen directly. It is comparison-only -- it never
-    affects Total_Block_Penalty or any other column evaluate_schedule()
-    already computed, exactly the same relationship Enercast has with the
-    official schedule.
+    This lets an earlier stage of a multi-step AI forecasting pipeline (e.g.
+    Step 1's raw base forecast, or Step 2's weather-adjusted forecast, when
+    Step 3 is the official/final schedule) be penalised independently, so
+    the value each later stage adds (or costs) can be seen directly. It is
+    comparison-only -- it never affects Total_Block_Penalty or any other
+    column evaluate_schedule() already computed, exactly the same
+    relationship Enercast has with the official schedule.
 
-    A no-op (returns df unchanged) if "Step1_MW" isn't present -- callers
-    only invoke this when the AI Schedule file had the 2-step format.
+    A no-op (returns df unchanged) if `mw_col` isn't present -- callers
+    only invoke this when the AI Schedule file actually had that stage.
     """
-    if "Step1_MW" not in df.columns:
+    if mw_col not in df.columns:
         return df
 
     df = df.copy()
@@ -235,45 +238,71 @@ def evaluate_step1(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
     block_hours = plant.block_hours
     slabs = plant.dsm_slabs
 
-    # Step 1 is graded against the actual meter reading too -- if Actual is
-    # missing (block Pending), there is nothing to compare Step 1 against.
-    has_step1 = df["Step1_MW"].notna() & df["Actual_MW"].notna()
-    dev_mw = (df["Actual_MW"] - df["Step1_MW"]).where(has_step1)
+    # Graded against the actual meter reading too -- if Actual is missing
+    # (block Pending), there is nothing to compare this stage against.
+    has_stage = df[mw_col].notna() & df["Actual_MW"].notna()
+    dev_mw = (df["Actual_MW"] - df[mw_col]).where(has_stage)
     dev_pct = (dev_mw / capacity * 100.0)
     block_energy = (dev_mw * block_hours * 1000.0)
 
     penalties = np.full(len(df), np.nan)
-    for idx in df.index[has_step1]:
+    for idx in df.index[has_stage]:
         abs_pct = abs(dev_pct.loc[idx])
         energy_abs = abs(block_energy.loc[idx])
         _, _, tot = compute_block_penalty(abs_pct, energy_abs, slabs)
         penalties[df.index.get_loc(idx)] = tot
 
-    df["Step1_Deviation_MW"] = dev_mw
-    df["Step1_Deviation_%"] = dev_pct
-    df["Step1_Penalty"] = penalties
+    df[f"{prefix}_Deviation_MW"] = dev_mw
+    df[f"{prefix}_Deviation_%"] = dev_pct
+    df[f"{prefix}_Penalty"] = penalties
     return df
 
 
-def step1_summary(df: pd.DataFrame) -> Optional[dict]:
-    """Head-to-head roll-up (blocks both Step 1 and Step 2/Actual covered)
-    -- the official (Step 2) Total_Block_Penalty vs Step1_Penalty, and mean
-    absolute deviation for each. Returns None if no Step 1 data is
-    present."""
-    if "Step1_MW" not in df.columns:
+def _stage_summary(df: pd.DataFrame, mw_col: str, prefix: str, stage_label: str) -> Optional[dict]:
+    """Shared implementation behind step1_summary() / step2_summary(): a
+    head-to-head roll-up (blocks both this stage and the official schedule
+    covered) -- the official Total_Block_Penalty vs this stage's penalty,
+    and mean absolute deviation for each. Returns None if this stage's data
+    isn't present."""
+    if mw_col not in df.columns:
         return None
-    covered = df[df["Step1_Deviation_MW"].notna()] if "Step1_Deviation_MW" in df.columns \
-        else df[df["Step1_MW"].notna() & df["Actual_MW"].notna()]
+    dev_col = f"{prefix}_Deviation_MW"
+    covered = df[df[dev_col].notna()] if dev_col in df.columns \
+        else df[df[mw_col].notna() & df["Actual_MW"].notna()]
     n = len(covered)
     if n == 0:
         return None
     return {
         "Blocks compared": n,
-        "Step 2 (official) Total Penalty (Rs, same blocks)": float(covered["Total_Block_Penalty"].sum()),
-        "Step 1 (base forecast) Total Penalty (Rs)": float(covered["Step1_Penalty"].sum()),
-        "Step 2 Mean Abs Deviation (MW)": float(covered["Deviation_MW"].abs().mean()),
-        "Step 1 Mean Abs Deviation (MW)": float(covered["Step1_Deviation_MW"].abs().mean()),
+        "Official Total Penalty (Rs, same blocks)": float(covered["Total_Block_Penalty"].sum()),
+        f"{stage_label} Total Penalty (Rs)": float(covered[f"{prefix}_Penalty"].sum()),
+        "Official Mean Abs Deviation (MW)": float(covered["Deviation_MW"].abs().mean()),
+        f"{stage_label} Mean Abs Deviation (MW)": float(covered[dev_col].abs().mean()),
     }
+
+
+def evaluate_step1(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
+    """Step 1 (raw meter-base forecast) comparison columns -- see
+    _evaluate_comparison_stage(). A no-op if "Step1_MW" isn't present."""
+    return _evaluate_comparison_stage(df, plant, "Step1_MW", "Step1")
+
+
+def step1_summary(df: pd.DataFrame) -> Optional[dict]:
+    """Step 1 vs official head-to-head roll-up -- see _stage_summary()."""
+    return _stage_summary(df, "Step1_MW", "Step1", "Step 1 (base forecast)")
+
+
+def evaluate_step2(df: pd.DataFrame, plant: PlantConfig) -> pd.DataFrame:
+    """Step 2 (weather-adjusted forecast) comparison columns -- see
+    _evaluate_comparison_stage(). A no-op if "Step2_MW" isn't present (e.g.
+    when the file only has Step 1 + Step 2 and Step 2 is itself the
+    official schedule, so there's nothing to compare it against)."""
+    return _evaluate_comparison_stage(df, plant, "Step2_MW", "Step2")
+
+
+def step2_summary(df: pd.DataFrame) -> Optional[dict]:
+    """Step 2 vs official head-to-head roll-up -- see _stage_summary()."""
+    return _stage_summary(df, "Step2_MW", "Step2", "Step 2 (weather-adjusted)")
 
 
 def compute_daily_status(df: pd.DataFrame) -> str:

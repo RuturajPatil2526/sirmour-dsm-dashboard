@@ -171,41 +171,49 @@ def parse_energy_file(
     col_ts = find_column(df_raw, "timestamp")
     col_val_mw = find_column(df_raw, value_category)
     col_val_kw = find_column(df_raw, value_kw_category)
-    # 2-step AI Schedule format (only relevant for the schedule file itself).
-    col_step1 = find_column(df_raw, "mw_step1") if role == "schedule" else None
-    col_step2 = find_column(df_raw, "mw_step2") if role == "schedule" else None
+    # Multi-step AI Schedule format (only relevant for the schedule file
+    # itself): "Step 1 Meter Base Forecast MW" -> "Step 2 Weather Adjustment
+    # MW" -> "Step 3 Plant Profile Adjustment MW". Whichever of these is the
+    # LAST (highest-numbered) stage present in the file becomes the official
+    # Scheduled_MW that drives the main DSM report; every earlier stage that
+    # is also present is carried alongside as its own, independently
+    # penalised comparison column (see calculator.evaluate_step1/
+    # evaluate_step2) -- exactly like Enercast, but sourced from the same
+    # file. A file with only one step column (or the old single-column
+    # format) works exactly as before.
+    step_cols = {}
+    if role == "schedule":
+        for n in (1, 2, 3):
+            c = find_column(df_raw, f"mw_step{n}")
+            if c is not None:
+                step_cols[n] = c
 
     detected = {
         "date": col_date, "block": col_block, "timestamp": col_ts,
         "value_mw": col_val_mw, "value_kw": col_val_kw,
-        "step1_mw": col_step1, "step2_mw": col_step2,
+        "step1_mw": step_cols.get(1), "step2_mw": step_cols.get(2),
+        "step3_mw": step_cols.get(3),
     }
 
     # -- value column -------------------------------------------------
     value_series = None
-    step1_series = None
-    if col_step1 is not None or col_step2 is not None:
-        # New 2-step format: "Step 1 Meter Base Forecast MW" (base forecast)
-        # + "Step 2 Weather Adjustment MW" (final, weather-adjusted
-        # forecast). Step 2 becomes the official Scheduled_MW that drives
-        # the main DSM report; Step 1 is carried alongside as its own
-        # separately-penalised comparison column (see calculator.
-        # evaluate_step1) -- exactly like Enercast, but sourced from the
-        # same file. If only one of the two is present, it is used as the
-        # official schedule on its own.
-        if col_step2 is not None:
-            value_series = pd.to_numeric(df_raw[col_step2], errors="coerce")
-            detected["value_mw"] = col_step2
-        else:
-            value_series = pd.to_numeric(df_raw[col_step1], errors="coerce")
-            detected["value_mw"] = col_step1
-        if col_step1 is not None and col_step2 is not None:
-            step1_series = pd.to_numeric(df_raw[col_step1], errors="coerce")
+    comparison_step_series = {}  # {stage_number: pd.Series} for every non-official stage
+    if step_cols:
+        official_n = max(step_cols)
+        official_col = step_cols[official_n]
+        value_series = pd.to_numeric(df_raw[official_col], errors="coerce")
+        detected["value_mw"] = official_col
+        other_ns = sorted(n for n in step_cols if n != official_n)
+        if other_ns:
+            for n in other_ns:
+                comparison_step_series[n] = pd.to_numeric(df_raw[step_cols[n]], errors="coerce")
+            stage_word = "step" if len(step_cols) == 1 else f"{len(step_cols)}-step"
+            others_desc = ", ".join(f"'{step_cols[n]}' (Step {n})" for n in other_ns)
             warnings.append(
-                f"{label}: detected 2-step AI Schedule format — using "
-                f"'{col_step2}' (Step 2, weather-adjusted) as the official "
-                f"schedule, and '{col_step1}' (Step 1, base forecast) as a "
-                f"separate comparison-only schedule. Each is penalised "
+                f"{label}: detected {stage_word} AI Schedule format — using "
+                f"'{official_col}' (Step {official_n}, the final stage) as "
+                f"the official schedule, and {others_desc} as separate "
+                f"comparison-only schedule(s). Each is penalised "
                 f"independently against actual meter data."
             )
     elif col_val_mw is not None:
@@ -300,8 +308,8 @@ def parse_energy_file(
         detected["generated_at"] = col_gen_at
         if col_gen_at is not None:
             data["Generated_At"] = df_raw[col_gen_at].astype(str)
-        if step1_series is not None:
-            data["Step1_MW"] = step1_series
+        for n, series in comparison_step_series.items():
+            data[f"Step{n}_MW"] = series
 
     out = pd.DataFrame(data)
 
@@ -396,8 +404,10 @@ def merge_datasets(
     # final sanity: numeric coercion (NaN stays NaN -- never filled with 0)
     merged["Scheduled_MW"] = pd.to_numeric(merged["Scheduled_MW"], errors="coerce")
     merged["Actual_MW"] = pd.to_numeric(merged["Actual_MW"], errors="coerce")
-    if "Step1_MW" in merged.columns:
-        merged["Step1_MW"] = pd.to_numeric(merged["Step1_MW"], errors="coerce")
+    for n in (1, 2, 3):
+        col = f"Step{n}_MW"
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
     missing_sched = merged["Scheduled_MW"].isna()
     missing_meter = merged["Actual_MW"].isna()
@@ -417,8 +427,10 @@ def merge_datasets(
         )
 
     cols = ["Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW"]
-    if "Step1_MW" in merged.columns:
-        cols.append("Step1_MW")
+    for n in (1, 2, 3):
+        col = f"Step{n}_MW"
+        if col in merged.columns:
+            cols.append(col)
     if "Generated_At" in merged.columns:
         cols.append("Generated_At")
     merged = merged[cols]

@@ -129,6 +129,19 @@ COLUMN_ALIASES = {
         "step 2 mw", "step2 mw", "step 2 (mw)", "step2_mw",
         "weather adjusted mw", "weather adjusted (mw)",
     ],
+    # "Step 3 Plant Profile Adjustment MW" -- a third, further-refined stage
+    # on top of Step 2 (e.g. adjusting for the plant's own historical
+    # generation profile). When present, Step 3 becomes the official
+    # Scheduled_MW (it's the final value before submission); Step 1 and
+    # Step 2 both become comparison-only columns, each independently
+    # penalised (see utils.py / calculator.evaluate_step1 / evaluate_step2).
+    "mw_step3": [
+        "step 3 plant profile adjustment mw", "step 3 plant profile adjustment (mw)",
+        "step3 plant profile adjustment mw", "step 3 plant profile adjustment",
+        "plant profile adjustment mw", "plant profile adjustment (mw)",
+        "step 3 mw", "step3 mw", "step 3 (mw)", "step3_mw",
+        "plant profile adjusted mw", "plant profile adjusted (mw)",
+    ],
     "kw_predicted": [
         "predicted_kw", "predicted (kw)", "predicted kw",
         "ai schedule (kw)", "schedule_kw", "scheduled_kw", "forecast_kw",

@@ -26,7 +26,7 @@ from utils import (
 )
 from calculator import (
     evaluate_schedule, build_summary, day_summary_metrics, evaluate_enercast, enercast_summary,
-    evaluate_step1, step1_summary,
+    evaluate_step1, step1_summary, evaluate_step2, step2_summary,
 )
 from graphs import all_figures
 from excel_export import build_excel_report
@@ -177,9 +177,11 @@ with st.sidebar:
     schedule_file = st.file_uploader(
         "AI Schedule File (Predicted Generation)", type=["csv", "xlsx", "xls"],
         help="Must contain Date/Time and Predicted MW (or kW) for each block. "
-             "The 2-step format (Step 1 'Meter Base Forecast MW' + Step 2 "
-             "'Weather Adjustment MW') is also auto-detected — Step 2 becomes "
-             "the official schedule, and Step 1 is penalised separately for comparison.",
+             "The multi-step format (Step 1 'Meter Base Forecast MW', Step 2 "
+             "'Weather Adjustment MW' and/or Step 3 'Plant Profile Adjustment "
+             "MW') is also auto-detected — whichever step is the last one "
+             "present becomes the official schedule, and every earlier step "
+             "is penalised separately, purely for comparison.",
     )
     meter_file = st.file_uploader(
         "Meter Data File (Actual Generation)", type=["csv", "xlsx", "xls"],
@@ -268,12 +270,14 @@ if process_clicked or "result_df" in st.session_state:
                 )
                 result_df = evaluate_schedule(merged, plant)
 
-                # Step 1 (base forecast, before weather adjustment) is only
-                # present when the AI Schedule file used the 2-step format.
-                # It is comparison-only -- Total_Block_Penalty above is
-                # always graded against Step 2 (the official, weather-
-                # adjusted schedule), never against Step 1.
+                # Step 1 and/or Step 2 (earlier stages before the final,
+                # official stage) are only present when the AI Schedule file
+                # used the multi-step format. Both are comparison-only --
+                # Total_Block_Penalty above is always graded against
+                # whichever stage is the official schedule (the last one
+                # present), never against an earlier stage.
                 result_df = evaluate_step1(result_df, plant)
+                result_df = evaluate_step2(result_df, plant)
 
                 # Enercast is entirely optional and comparison-only -- it
                 # never touches result_df's own Scheduled_MW/Deviation/
@@ -399,31 +403,42 @@ if "Enercast_MW" in result_df.columns:
         )
 
 # ---------------------------------------------------------------------------
-# Step 1 vs Step 2 comparison KPIs (only when the AI Schedule file used the
-# 2-step format) -- Step 2 (weather-adjusted) is the official schedule
-# graded above; Step 1 (base forecast) is penalised separately, purely for
-# comparison, so the value the weather-adjustment step adds is visible here.
+# Stage (Step 1 / Step 2) comparison KPIs (only when the AI Schedule file
+# used the multi-step format) -- whichever stage is the LAST one present in
+# the file is the official schedule graded above; every earlier stage is
+# penalised separately, purely for comparison, one panel each, so the value
+# each later stage's adjustment adds is visible here.
 # ---------------------------------------------------------------------------
-if "Step1_MW" in result_df.columns:
-    s1_summary_top = step1_summary(result_df)
-    if s1_summary_top:
-        st.markdown(
-            '<div class="section-header" style="font-size:1.05rem;">🌦️ Step 2 (official) vs Step 1 (base forecast)</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "🩷 Step 1 (meter-base forecast, before weather adjustment) is shown only for comparison — "
-            "the official AI Schedule and Total DSM Penalty above are always Step 2 (weather-adjusted)."
-        )
-        rs1, rs2, rs3, rs4 = st.columns(4)
-        rs1.metric("Blocks Compared", s1_summary_top["Blocks compared"])
-        rs2.metric("Step 2 Penalty (same blocks)", f"₹{s1_summary_top['Step 2 (official) Total Penalty (Rs, same blocks)']:.2f}")
-        rs3.metric("Step 1 Penalty", f"₹{s1_summary_top['Step 1 (base forecast) Total Penalty (Rs)']:.2f}")
-        rs4.metric(
-            "Step 2 Mean Abs Deviation", f"{s1_summary_top['Step 2 Mean Abs Deviation (MW)']:.3f} MW",
-            delta=f"{s1_summary_top['Step 2 Mean Abs Deviation (MW)'] - s1_summary_top['Step 1 Mean Abs Deviation (MW)']:+.3f} MW vs Step 1",
-            delta_color="inverse",
-        )
+_active_stage_ns = [n_ for n_ in (1, 2) if f"Step{n_}_MW" in result_df.columns]
+_official_stage_n = (max(_active_stage_ns) + 1) if _active_stage_ns else None
+_stage_summary_fns = {1: step1_summary, 2: step2_summary}
+_stage_emoji = {1: "🩷", 2: "🟣"}
+_stage_names = {1: "Step 1 (base forecast)", 2: "Step 2 (weather-adjusted)"}
+for _n in _active_stage_ns:
+    _st_summary_top = _stage_summary_fns[_n](result_df)
+    if not _st_summary_top:
+        continue
+    st.markdown(
+        f'<div class="section-header" style="font-size:1.05rem;">'
+        f'{_stage_emoji[_n]} Step {_official_stage_n} (official) vs {_stage_names[_n]}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"{_stage_emoji[_n]} {_stage_names[_n]} is shown only for comparison — "
+        f"the official AI Schedule and Total DSM Penalty above are always Step {_official_stage_n}."
+    )
+    _stage_key = _stage_names[_n]
+    rs1, rs2, rs3, rs4 = st.columns(4)
+    rs1.metric("Blocks Compared", _st_summary_top["Blocks compared"])
+    rs2.metric(f"Step {_official_stage_n} Penalty (same blocks)",
+               f"₹{_st_summary_top['Official Total Penalty (Rs, same blocks)']:.2f}")
+    rs3.metric(f"Step {_n} Penalty", f"₹{_st_summary_top[f'{_stage_key} Total Penalty (Rs)']:.2f}")
+    rs4.metric(
+        f"Step {_official_stage_n} Mean Abs Deviation",
+        f"{_st_summary_top['Official Mean Abs Deviation (MW)']:.3f} MW",
+        delta=f"{_st_summary_top['Official Mean Abs Deviation (MW)'] - _st_summary_top[f'{_stage_key} Mean Abs Deviation (MW)']:+.3f} MW vs Step {_n}",
+        delta_color="inverse",
+    )
 
 # ---------------------------------------------------------------------------
 # Filters
@@ -488,11 +503,15 @@ with tab_charts:
                 "🔵 Enercast is plotted alongside for comparison on every chart below — "
                 "our own forecast is still graded against actual meter data only, never against Enercast."
             )
-        if "Step1_MW" in filtered.columns:
+        _chart_active_stage_ns = [n_ for n_ in (1, 2) if f"Step{n_}_MW" in filtered.columns]
+        if _chart_active_stage_ns:
+            _chart_official_n = max(_chart_active_stage_ns) + 1
+            _chart_stage_names = {1: "Step 1 (base forecast)", 2: "Step 2 (weather-adjusted)"}
+            _chart_stage_list = " and ".join(_chart_stage_names[n_] for n_ in _chart_active_stage_ns)
             st.caption(
-                "🩷 Step 1 (base forecast, before weather adjustment) is plotted alongside Step 2 "
-                "(the official, weather-adjusted schedule) for comparison — each is penalised "
-                "independently against actual meter data."
+                f"🩷 {_chart_stage_list} {'is' if len(_chart_active_stage_ns) == 1 else 'are'} plotted "
+                f"alongside Step {_chart_official_n} (the official schedule) for comparison — each is "
+                f"penalised independently against actual meter data."
             )
         figs = all_figures(filtered)
         c1, c2 = st.columns(2)
@@ -512,22 +531,30 @@ with tab_table:
     with size_col:
         page_size = st.selectbox("Rows per page", [10, 25, 50, 96, "All"], index=1)
 
+    _tbl_active_stage_ns = [n_ for n_ in (1, 2) if f"Step{n_}_MW" in filtered.columns]
+    _tbl_official_n = (max(_tbl_active_stage_ns) + 1) if _tbl_active_stage_ns else None
     display_cols = [
         "Date", "Block", "Time_Label", "Scheduled_MW", "Actual_MW", "Deviation_MW",
         "Deviation_%", "Abs_Deviation_%", "Block_Energy_kWh", "Total_Block_Penalty",
         "Deviation_Type", "Status", "PPA_Amount",
-        "Step1_MW", "Step1_Deviation_MW", "Step1_Penalty",
     ]
+    for _n in _tbl_active_stage_ns:
+        display_cols += [f"Step{_n}_MW", f"Step{_n}_Deviation_MW", f"Step{_n}_Penalty"]
     display_cols = [c for c in display_cols if c in filtered.columns]
-    table_df = filtered[display_cols].rename(columns={
-        "Time_Label": "Time Block", "Scheduled_MW": "Scheduled MW (Step 2)", "Actual_MW": "Actual MW",
+    rename_map = {
+        "Time_Label": "Time Block",
+        "Scheduled_MW": f"Scheduled MW (Step {_tbl_official_n})" if _tbl_official_n else "Scheduled MW",
+        "Actual_MW": "Actual MW",
         "Deviation_MW": "Deviation MW", "Deviation_%": "Deviation %",
         "Abs_Deviation_%": "Abs Deviation %", "Block_Energy_kWh": "Block Energy (kWh)",
         "Total_Block_Penalty": "Total Penalty (₹)", "Deviation_Type": "Deviation Type",
         "PPA_Amount": "PPA Amount (₹)",
-        "Step1_MW": "Step 1 MW", "Step1_Deviation_MW": "Step 1 Deviation MW",
-        "Step1_Penalty": "Step 1 Penalty (₹)",
-    })
+    }
+    for _n in _tbl_active_stage_ns:
+        rename_map[f"Step{_n}_MW"] = f"Step {_n} MW"
+        rename_map[f"Step{_n}_Deviation_MW"] = f"Step {_n} Deviation MW"
+        rename_map[f"Step{_n}_Penalty"] = f"Step {_n} Penalty (₹)"
+    table_df = filtered[display_cols].rename(columns=rename_map)
 
     if search_term:
         mask = table_df.astype(str).apply(
@@ -560,20 +587,35 @@ with tab_table:
             styles = [s + ";background-color:#FDE68A" if s else "background-color:#FDE68A" for s in styles]
         return styles
 
-    styled = page_df.style.apply(_highlight, axis=1).format({
-        "Scheduled MW (Step 2)": "{:.3f}", "Actual MW": "{:.3f}", "Deviation MW": "{:.3f}",
+    _tbl_fmt = {
+        "Actual MW": "{:.3f}", "Deviation MW": "{:.3f}",
         "Deviation %": "{:.2f}%", "Abs Deviation %": "{:.2f}%",
         "Block Energy (kWh)": "{:.1f}", "Total Penalty (₹)": "₹{:.2f}",
         "PPA Amount (₹)": "₹{:.2f}",
-        "Step 1 MW": "{:.3f}", "Step 1 Deviation MW": "{:.3f}", "Step 1 Penalty (₹)": "₹{:.2f}",
-    }, na_rep="—")
+    }
+    _tbl_fmt[rename_map["Scheduled_MW"]] = "{:.3f}"
+    for _n in _tbl_active_stage_ns:
+        _tbl_fmt[f"Step {_n} MW"] = "{:.3f}"
+        _tbl_fmt[f"Step {_n} Deviation MW"] = "{:.3f}"
+        _tbl_fmt[f"Step {_n} Penalty (₹)"] = "₹{:.2f}"
+    styled = page_df.style.apply(_highlight, axis=1).format(_tbl_fmt, na_rep="—")
     st.caption("🔴 Highest penalty block   🟡 Highest absolute deviation block   "
                "⚪ — = Pending block (schedule/meter data missing, penalty null)")
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with tab_report:
     has_enercast = "Enercast_MW" in result_df.columns
-    has_step1 = "Step1_MW" in result_df.columns
+    _active_stage_ns = [n_ for n_ in (1, 2) if f"Step{n_}_MW" in result_df.columns]
+    _official_stage_n = (max(_active_stage_ns) + 1) if _active_stage_ns else None
+    _stage_names = {1: "Step 1 (base forecast)", 2: "Step 2 (weather-adjusted)"}
+    _stage_caption = ""
+    if _active_stage_ns:
+        _stage_list = " and ".join(_stage_names[n_] for n_ in _active_stage_ns)
+        _stage_caption = (
+            f" {_stage_list} {'is' if len(_active_stage_ns) == 1 else 'are'} shown alongside "
+            f"for comparison only — the official schedule and Total DSM Penalty are "
+            f"always Step {_official_stage_n}."
+        )
     st.caption(
         "This mirrors the exact layout of the downloadable Excel report "
         "(\"Schedule vs Meter + Penalty\") — the full day's data, not affected "
@@ -581,10 +623,7 @@ with tab_report:
         + (" Enercast is shown alongside for comparison only — our forecast is "
            "graded against actual meter data, never against Enercast."
            if has_enercast else "")
-        + (" Step 1 (base forecast, before weather adjustment) is shown alongside "
-           "for comparison only — the official schedule and Total DSM Penalty are "
-           "always Step 2 (weather-adjusted)."
-           if has_step1 else "")
+        + _stage_caption
     )
 
     report_cols = ["Block", "Time_Label", "Scheduled_MW", "Actual_MW",
@@ -613,14 +652,14 @@ with tab_report:
             "Enercast Deviation % (Capacity)": "{:+.2f}", "Enercast Penalty (Rs)": "{:.2f}",
         })
 
-    if has_step1:
-        report_df["Step 1 Forecast (MW)"] = result_df["Step1_MW"]
-        report_df["Step 1 Deviation (MW)"] = result_df["Step1_Deviation_MW"]
-        report_df["Step 1 Deviation % (Capacity)"] = result_df["Step1_Deviation_%"]
-        report_df["Step 1 Penalty (Rs)"] = result_df["Step1_Penalty"]
+    for _n in _active_stage_ns:
+        report_df[f"Step {_n} Forecast (MW)"] = result_df[f"Step{_n}_MW"]
+        report_df[f"Step {_n} Deviation (MW)"] = result_df[f"Step{_n}_Deviation_MW"]
+        report_df[f"Step {_n} Deviation % (Capacity)"] = result_df[f"Step{_n}_Deviation_%"]
+        report_df[f"Step {_n} Penalty (Rs)"] = result_df[f"Step{_n}_Penalty"]
         fmt_dict.update({
-            "Step 1 Forecast (MW)": "{:.3f}", "Step 1 Deviation (MW)": "{:+.3f}",
-            "Step 1 Deviation % (Capacity)": "{:+.2f}", "Step 1 Penalty (Rs)": "{:.2f}",
+            f"Step {_n} Forecast (MW)": "{:.3f}", f"Step {_n} Deviation (MW)": "{:+.3f}",
+            f"Step {_n} Deviation % (Capacity)": "{:+.2f}", f"Step {_n} Penalty (Rs)": "{:.2f}",
         })
 
     if "PPA_Amount" in result_df.columns:
@@ -665,20 +704,29 @@ with tab_report:
                        delta=f"{e_summary['Our Mean Abs Deviation (MW)'] - e_summary['Enercast Mean Abs Deviation (MW)']:+.3f} MW vs Enercast",
                        delta_color="inverse")
 
-    if has_step1:
-        s1_summary = step1_summary(result_df)
-        if s1_summary:
-            st.markdown(
-                '<div class="section-header" style="font-size:1.05rem;">🌦️ Step 2 (official) vs Step 1 (base forecast)</div>',
-                unsafe_allow_html=True,
-            )
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Blocks compared", s1_summary["Blocks compared"])
-            sc2.metric("Step 2 Penalty (same blocks)", f"₹{s1_summary['Step 2 (official) Total Penalty (Rs, same blocks)']:.2f}")
-            sc3.metric("Step 1 Penalty", f"₹{s1_summary['Step 1 (base forecast) Total Penalty (Rs)']:.2f}")
-            sc4.metric("Step 2 Mean Abs Deviation", f"{s1_summary['Step 2 Mean Abs Deviation (MW)']:.3f} MW",
-                       delta=f"{s1_summary['Step 2 Mean Abs Deviation (MW)'] - s1_summary['Step 1 Mean Abs Deviation (MW)']:+.3f} MW vs Step 1",
-                       delta_color="inverse")
+    _stage_summary_fns = {1: step1_summary, 2: step2_summary}
+    _stage_emoji = {1: "🩷", 2: "🟣"}
+    for _n in _active_stage_ns:
+        _st_summary = _stage_summary_fns[_n](result_df)
+        if not _st_summary:
+            continue
+        st.markdown(
+            f'<div class="section-header" style="font-size:1.05rem;">'
+            f'{_stage_emoji[_n]} Step {_official_stage_n} (official) vs {_stage_names[_n]}</div>',
+            unsafe_allow_html=True,
+        )
+        _stage_key = _stage_names[_n]
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Blocks compared", _st_summary["Blocks compared"])
+        sc2.metric(f"Step {_official_stage_n} Penalty (same blocks)",
+                   f"₹{_st_summary['Official Total Penalty (Rs, same blocks)']:.2f}")
+        sc3.metric(f"Step {_n} Penalty", f"₹{_st_summary[f'{_stage_key} Total Penalty (Rs)']:.2f}")
+        sc4.metric(
+            f"Step {_official_stage_n} Mean Abs Deviation",
+            f"{_st_summary['Official Mean Abs Deviation (MW)']:.3f} MW",
+            delta=f"{_st_summary['Official Mean Abs Deviation (MW)'] - _st_summary[f'{_stage_key} Mean Abs Deviation (MW)']:+.3f} MW vs Step {_n}",
+            delta_color="inverse",
+        )
 
     st.markdown('<div class="section-header" style="font-size:1.05rem;">📑 Day Summary — Accuracy and DSM Penalty</div>',
                 unsafe_allow_html=True)
